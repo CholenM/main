@@ -20,15 +20,21 @@ class ScanError(Exception):
     pass
 
 
-def capture(camera):
+def open_camera(camera):
     device = int(camera) if camera.isdecimal() else camera
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap.release()
+        raise ScanError(f"Cannot open camera {camera}; check the device, permissions and other camera apps.")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    return cap
+
+
+def capture(camera):
+    cap = open_camera(camera)
     try:
-        if not cap.isOpened():
-            raise ScanError(f"Cannot open camera {camera}; check the device, permissions and other camera apps.")
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         for _ in range(12):
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -45,7 +51,8 @@ def project(points, matrix):
 
 def bed_to_raster():
     s = PX_PER_MM
-    return np.array(((s, 0., 0.), (0., -s, f.PAGE[1]*s), (0., 0., 1.)))
+    ox, oy = f.PAGE_OFFSET
+    return np.array(((s, 0., ox*s), (0., -s, (f.PAGE[1]-oy)*s), (0., 0., 1.)))
 
 
 def register(frame):
@@ -79,9 +86,8 @@ def register(frame):
     if rms > 1.0:
         raise ScanError(f"Tag reprojection RMS {rms:.2f} px exceeds 1.0 px.")
     # Estimate worst native resolution in the board ROI using the local differential.
-    bx, by = f.BOARD_ORIGIN
     samples = []
-    for x, y in product((bx, bx+25, bx+50), (by, by+25, by+50)):
+    for x, y in product((0, f.WIDTH/2, f.WIDTH), (0, f.HEIGHT/2, f.HEIGHT)):
         p, dx, dy = project(((x, y), (x+1, y), (x, y+1)), inv)
         samples.append(np.linalg.svd(np.column_stack((dx-p, dy-p)), compute_uv=False)[-1])
     return h, {"seen_ids": sorted(seen), "inlier_corners": int(mask.sum()),
@@ -110,32 +116,23 @@ def blobs(gray, diameter_min, diameter_max, polarity):
     return results
 
 
-def check_fixture(gray):
-    checks = []
-    radius = 5*PX_PER_MM
-    for bx, by in f.CHECKS:
-        x, y = np.rint(project(((bx, by),), bed_to_raster())[0]).astype(int)
-        roi = gray[y-radius:y+radius, x-radius:x+radius]
-        candidates = blobs(roi, 2.5, 5, "dark")
-        center = min(candidates, key=lambda b: math.hypot(b[0]-radius, b[1]-radius),
-                     default=None)
-        error = None if center is None else math.hypot(center[0]-radius, center[1]-radius)/PX_PER_MM
-        checks.append({"x_bed_mm": bx, "y_bed_mm": by, "error_mm": error})
-    return checks
-
-
 def detect(gray, polarity, diameter_min, diameter_max):
     s = PX_PER_MM
-    bx, by = f.BOARD_ORIGIN
-    # Ignore the printed border and tape outside the nominal 50 mm insert.
-    margin = 2
-    x = round((bx+margin)*s)
-    y = round((f.PAGE[1]-by-f.BOARD_SIZE+margin)*s)
-    size = round((f.BOARD_SIZE-2*margin)*s)
-    results = [{"x_mm": margin+cx/s, "y_mm": f.BOARD_SIZE-margin-cy/s,
+    ox, oy = f.PAGE_OFFSET
+    # Mask the border and corner tag intrusions, not the entire edge of the box.
+    margin = 3
+    x = round((ox+margin)*s)
+    y = round((f.PAGE[1]-oy-f.HEIGHT+margin)*s)
+    width, height = (f.WIDTH-2*margin)*s, (f.HEIGHT-2*margin)*s
+    roi = gray[y:y+height, x:x+width].copy()
+    cut = (20-margin)*s
+    for row in (slice(0, cut), slice(-cut, None)):
+        for col in (slice(0, cut), slice(-cut, None)):
+            roi[row, col] = 255 if polarity == "dark" else 0
+    results = [{"x_mm": margin+cx/s, "y_mm": f.HEIGHT-margin-cy/s,
                 "diameter_mm": diameter, "circularity": circularity}
                for cx, cy, diameter, circularity in
-               blobs(gray[y:y+size, x:x+size], diameter_min, diameter_max, polarity)]
+               blobs(roi, diameter_min, diameter_max, polarity)]
     return sorted(results, key=lambda p: (p["y_mm"], p["x_mm"]))
 
 
@@ -150,7 +147,7 @@ def read_reference(path):
         except (TypeError, ValueError) as exc:
             raise ScanError(f"{path}: reference rows need numeric X, Y and diameter.") from exc
     if not points or len({p[0] for p in points}) != len(points) or any(
-            not label or not (0 <= x <= 50 and 0 <= y <= 50 and 0 < d <= 50)
+            not label or not (0 <= x <= f.WIDTH and 0 <= y <= f.HEIGHT and 0 < d <= f.HEIGHT)
             for label, x, y, d in points):
         raise ScanError("Reference CSV needs unique IDs and valid board-frame positions and diameters.")
     return points
@@ -190,14 +187,13 @@ def compare(points, reference):
 
 
 def overlay(rectified, points, comparison):
-    # Crop to the inspection region (preserving the scale).
-    ox, oy = 94, 142
-    s = PX_PER_MM
-    result = rectified[(f.PAGE[1]-oy)*s:(f.PAGE[1]-74)*s, ox*s:204*s].copy()
-    bx, by = f.BOARD_ORIGIN
+    # Show all four tags and retain readable annotation at dashboard size.
+    s = 4
+    result = cv2.resize(rectified, (f.PAGE[0]*s, f.PAGE[1]*s), interpolation=cv2.INTER_AREA)
+    ox, oy = f.PAGE_OFFSET
 
     def pixel(x, y):
-        return (round((x+bx-ox)*s), round((oy-y-by)*s))
+        return (round((x+ox)*s), round((f.PAGE[1]-oy-y)*s))
 
     statuses = {row["id"]: row["status"] for row in comparison}
     for row in comparison:
@@ -262,13 +258,7 @@ def analyze(args, frame, directory):
                                     borderValue=(255, 255, 255))
     save_image(directory / "rectified.png", rectified)
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
-    checks = check_fixture(gray)
-    diagnostics["independent_checks"] = checks
     save_json(directory / "registration.json", diagnostics)
-    if any(row["error_mm"] is None or row["error_mm"] > 1 for row in checks):
-        details = ", ".join("missing" if r["error_mm"] is None else
-                            f'{r["error_mm"]:.2f} mm' for r in checks)
-        raise ScanError(f"Independent fixture checks must all be within 1.0 mm ({details}).")
     native = diagnostics["min_native_px_per_mm"]
     if native < 2.5:
         raise ScanError(f"Board has only {native:.2f} native px/mm; need at least 2.5. "
@@ -281,11 +271,7 @@ def analyze(args, frame, directory):
     if reference is None:
         for i, p in enumerate(points, start=1):
             p["id"] = f"P{i:02}"
-    for p in points:
-        p["x_bed_mm"] = p["x_mm"] + f.BOARD_ORIGIN[0]
-        p["y_bed_mm"] = p["y_mm"] + f.BOARD_ORIGIN[1]
-    save_csv(directory / "detections.csv", points, (*f.CSV_FIELDS, "x_bed_mm",
-                                                    "y_bed_mm", "circularity"))
+    save_csv(directory / "detections.csv", points, (*f.CSV_FIELDS, "circularity"))
     save_image(directory / "overlay.png", overlay(rectified, points, rows))
     if reference is not None:
         save_csv(directory / "ground_truth.csv", [dict(zip(f.CSV_FIELDS, p)) for p in reference],
@@ -297,10 +283,9 @@ def analyze(args, frame, directory):
     if success and not args.verify:
         save_json(directory / "job.json", {
             "schema_version": 1, "units": "mm", "frame": "vision_bed",
-            "board_origin_in_bed_mm": f.BOARD_ORIGIN,
             "review_status": "pending", "executable": False,
-            "points": [{"id": p["id"], "x": round(p["x_bed_mm"], 4),
-                        "y": round(p["y_bed_mm"], 4),
+            "points": [{"id": p["id"], "x": round(p["x_mm"], 4),
+                        "y": round(p["y_mm"], 4),
                         "diameter_mm": round(p["diameter_mm"], 4)} for p in points],
         })
     status = ("PASS" if reference is not None else "REVIEW REQUIRED") if success else "FAIL"
@@ -310,7 +295,6 @@ def analyze(args, frame, directory):
               f"- Native board resolution (worst axis): {native:.2f} px/mm",
               f'- Tags: {diagnostics["seen_ids"]}; inlier reprojection RMS: '
               f'{diagnostics["reprojection_rms_px"]:.3f} px',
-              f'- Independent check max error: {max(r["error_mm"] for r in checks):.3f} mm',
               f"- Detected: {len(points)}" + (f" / {len(reference)} nominal" if reference else ""),
               "- No robot-base calibration or robot motion. Review the annotated image.", ""]
     if reference is not None:

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SCARA Vision</title>
+<style>
+:root{color-scheme:dark;--bg:#101719;--panel:#172124;--line:#2b393d;--txt:#ebf1ef;--muted:#a2b2b2;--accent:#77e3c4;--bad:#ffa99c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,sans-serif}
+main{max-width:1220px;margin:auto;padding:clamp(15px,3vw,34px)}
+header,.bar,.summary,.actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+header{margin-bottom:23px}
+h1,h2,p{margin:0}
+h1{font-size:clamp(24px,4vw,38px);letter-spacing:-.045em}
+h2{font-size:17px}
+small,.muted,th{color:var(--muted)}
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
+.badge{border:1px solid var(--line);border-radius:100px;padding:6px 11px;font-size:12px;white-space:nowrap}
+.badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:currentColor;vertical-align:1px}
+.ok{color:var(--accent)}.bad{color:var(--bad)}.busy{color:#f8d386}
+.layout{display:grid;grid-template-columns:minmax(0,2.15fr) minmax(245px,1fr);gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:15px;min-width:0}
+.image{position:relative;margin-top:12px;background:#090e10;border-radius:9px;min-height:230px;aspect-ratio:16/9;display:grid;place-items:center;overflow:hidden}
+.image img{width:100%;height:100%;max-height:60vh;object-fit:contain;position:absolute}
+.image span{text-align:center;padding:1rem}
+button{cursor:pointer;border:1px solid var(--line);border-radius:8px;background:#213035;padding:8px 13px;color:var(--txt);font:inherit}
+button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
+button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button:disabled{cursor:default;opacity:.5}
+.primary{margin-top:15px;width:100%;background:var(--accent);color:#132321;font-weight:750;padding:11px}
+.summary{margin:16px 0}
+.summary strong{display:block;font-size:clamp(19px,2.8vw,30px);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
+#message{margin-top:11px;min-height:1.5em}
+.table{margin-top:16px;overflow:auto}
+table{border-collapse:collapse;width:100%;margin-top:7px;font-variant-numeric:tabular-nums;white-space:nowrap}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+th{font-size:12px} tbody tr:last-child td{border-bottom:0}
+a{color:var(--accent);font-size:13px}
+footer{margin-top:12px;color:var(--muted);font-size:12px}
+[hidden]{display:none!important}
+@media(max-width:730px){.layout{grid-template-columns:1fr}.image img{max-height:none}}
+</style>
+<main>
+  <header>
+    <div><p class="eyebrow">Robotics lab / inspection</p><h1>SCARA Vision</h1></div>
+    <span class="badge" id="connection">Connecting</span>
+  </header>
+  <div class="layout">
+    <section class="card" aria-label="Camera and scan image">
+      <div class="bar"><h2 id="image-title">Live preview</h2><div class="actions">
+        <button id="live" type="button" aria-pressed="true">Live</button>
+        <button id="result" type="button" aria-pressed="false" disabled>Result</button>
+      </div></div>
+      <div class="image"><img id="view" alt="" hidden><span class="muted" id="placeholder">Waiting for camera…</span></div>
+    </section>
+    <section class="card" aria-label="Scan controls">
+      <div class="bar"><h2>Last scan</h2><span id="status" class="badge">Not scanned</span></div>
+      <div class="summary">
+        <div><small>Detected</small><strong id="count">—</strong></div>
+        <div><small>Mean error</small><strong id="mean">—</strong></div>
+        <div><small>Max error</small><strong id="max">—</strong></div>
+      </div>
+      <p class="muted">235 × 127 mm fixture · Ø3 mm nominal<br>Scan uses a full-resolution snapshot.</p>
+      <button class="primary" id="scan" type="button" disabled>Scan <span aria-hidden="true">· S</span></button>
+      <p class="muted" id="message" role="status"></p>
+    </section>
+  </div>
+  <section class="card table" aria-label="Measured points">
+    <div class="bar"><h2>Measured points</h2><div id="links" class="actions"></div></div>
+    <table><thead><tr><th scope="col">ID</th><th scope="col">X (mm)</th><th scope="col">Y (mm)</th><th scope="col">Ø (mm)</th><th scope="col">Error (mm)</th><th scope="col">Check</th></tr></thead>
+    <tbody id="points"><tr><td colspan="6" class="muted">Scan to see coordinates.</td></tr></tbody></table>
+  </section>
+  <footer>Fixture origin: lower-left tag center · X right, Y up · No robot motion</footer>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let state, last, mode = 'live', requesting = false, error = '';
+const number = value => value != null && value !== '' ? Number(value).toFixed(2) : '—';
+function image() {
+  const replay = state?.mode === 'replay';
+  const source = mode === 'result' ? last?.files['overlay.png'] || last?.files['raw.png'] :
+    state?.ready && !replay ? '/stream.mjpg' : null;
+  $('live').disabled = replay;
+  $('result').disabled = !last;
+  $('live').setAttribute('aria-pressed', mode === 'live');
+  $('result').setAttribute('aria-pressed', mode === 'result');
+  $('image-title').textContent = mode === 'result' ? 'Scan result' : 'Live preview';
+  $('view').alt = mode === 'result' ? 'Frozen scan result' : 'Live camera preview';
+  $('view').hidden = !source;
+  $('placeholder').hidden = !!source;
+  $('placeholder').textContent = state?.camera_error || 'Waiting for camera…';
+  if (source && $('view').getAttribute('src') !== source) $('view').src = source;
+  if (!source) $('view').removeAttribute('src');
+}
+function result(value) {
+  if (!value || (last && last.id >= value.id)) return;
+  last = value;
+  $('status').textContent = value.status;
+  $('status').className = 'badge ' + (value.status === 'PASS' ? 'ok' : !value.passed ? 'bad' : '');
+  $('count').textContent = value.detected + (value.expected == null ? '' : ` / ${value.expected}`);
+  for (const key of ['mean','max']) $(key).textContent = value[key+'_mm'] == null ? '—' : number(value[key+'_mm'])+' mm';
+  const pts = new Map(value.points.map(p => [p.id, p]));
+  const rows = value.errors.length ? value.errors : value.points;
+  $('points').replaceChildren();
+  for (const row of rows) {
+    const p = pts.get(row.id);
+    const tr = document.createElement('tr');
+    for (const n of [row.id, number(p?.x_mm), number(p?.y_mm), number(p?.diameter_mm),
+                     number(row.radial_mm), row.status || 'Review']) {
+      const td = document.createElement('td'); td.textContent = n; tr.append(td);
+    }
+    $('points').append(tr);
+  }
+  if (!rows.length) {
+    const td = document.createElement('td'); td.colSpan = 6; td.textContent = 'No measured points.';
+    const tr = document.createElement('tr'); tr.append(td); $('points').append(tr);
+  }
+  $('links').replaceChildren();
+  for (const [name, label] of [['detections.csv','Coordinates CSV'],['report.md','Report'],['job.json','Job JSON']]) {
+    if (!value.files[name]) continue;
+    const a = document.createElement('a'); a.href = value.files[name]; a.textContent = label; a.download = name; $('links').append(a);
+  }
+}
+function controls() {
+  const busy = requesting || state?.busy;
+  const label = state?.camera_error ? 'Camera offline' : busy ? 'Scanning' :
+    state?.mode === 'replay' ? 'Replay · saved image' : state?.ready ? 'Live camera' : 'Connecting';
+  $('connection').textContent = label;
+  $('connection').className = 'badge ' + (state?.camera_error ? 'bad' : busy ? 'busy' : state?.ready ? 'ok' : '');
+  $('scan').disabled = !state?.ready || !!busy;
+  $('scan').textContent = busy ? 'Scanning…' : state?.verify ? 'Verify · S' : 'Scan · S';
+  $('message').textContent = error || last?.message || (state?.verify ? 'Inspection mode · no job export.' : '');
+  image();
+}
+async function refresh() {
+  try {
+    const res = await fetch('/api/state');
+    if (!res.ok) throw Error('Dashboard disconnected.');
+    state = await res.json();
+    result(state.last);
+    if (state.mode === 'replay') mode = 'result';
+    if (!requesting && error === 'Dashboard disconnected.') error = '';
+  } catch (_) { state = undefined; error = 'Dashboard disconnected.'; }
+  controls();
+  setTimeout(refresh, 800);
+}
+async function measure() {
+  if ($('scan').disabled) return;
+  requesting = true; error = ''; controls();
+  try {
+    const res = await fetch('/api/scan', {method:'POST'});
+    const payload = await res.json();
+    if (!res.ok) throw Error(payload.error || 'Scan failed.');
+    result(payload); mode = 'result';
+  } catch (err) { error = err.message; }
+  finally { requesting = false; controls(); }
+}
+$('live').onclick = () => { mode = 'live'; image(); };
+$('result').onclick = () => { mode = 'result'; image(); };
+$('scan').onclick = measure;
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() === 's' && !event.repeat && !event.metaKey && !event.ctrlKey && !event.altKey) measure();
+});
+refresh();
+</script>
+</html>
