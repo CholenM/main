@@ -1,1 +1,4 @@
 Docs/plans
+__pycache__/
+/runs/
+Docs/print
