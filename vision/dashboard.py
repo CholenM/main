@@ -20,11 +20,14 @@ FILES = ("raw.png", "rectified.png", "overlay.png", "report.md", "detections.csv
 
 
 class LiveCamera:
-    def __init__(self, device):
+    def __init__(self, device, *, encode_preview=True):
         self.device = device
+        self.encode_preview = encode_preview
         self.changed = Condition()
         self.closed = Event()
         self.frame = None
+        self.frame_at = None
+        self.frame_sequence = 0
         self.jpeg = None
         self.sequence = 0
         self.error = None
@@ -43,7 +46,8 @@ class LiveCamera:
     def read(self):
         cap = None
         try:
-            cap = scan.open_camera(self.device)
+            cap = (scan.open_camera(self.device) if self.encode_preview else
+                   scan.open_camera(self.device, size=(1280, 720), fps=30))
             next_preview = 0
             while not self.closed.is_set():
                 ok, frame = cap.read()
@@ -52,7 +56,11 @@ class LiveCamera:
                 now = time.monotonic()
                 with self.changed:
                     self.frame = frame
-                if now >= next_preview:
+                    if not self.encode_preview:
+                        self.frame_at = now
+                        self.frame_sequence += 1
+                        self.changed.notify_all()
+                if self.encode_preview and now >= next_preview:
                     width = min(640, frame.shape[1])
                     height = round(width * frame.shape[0] / frame.shape[1])
                     preview = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
@@ -84,6 +92,16 @@ class LiveCamera:
             if not ready or self.error or self.closed.is_set():
                 return None
             return self.sequence, self.jpeg
+
+    def next_raw(self, previous, timeout):
+        """Wait for the newest raw frame; intermediate frames are not queued."""
+        with self.changed:
+            ready = self.changed.wait_for(
+                lambda: self.frame_sequence != previous or self.error or self.closed.is_set(),
+                timeout)
+            if not ready or self.error or self.closed.is_set():
+                return None
+            return self.frame_sequence, self.frame, self.frame_at
 
 
 class Session:

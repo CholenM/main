@@ -295,6 +295,24 @@ class RobotTest(unittest.TestCase):
             self.assertTrue(client.status()["homed"])
             self.assertEqual(client.status()["pos"]["z"], 50)
 
+    def test_large_manual_jogs_are_z_only_and_stay_in_bounds(self):
+        with server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True, manual_only=True)
+            expected = 0
+            for delta in (-1000, -500, -100, 100, 500, 1000):
+                workflow.launch("z-jog", data=dict(client.status(), axis="z", delta=delta))
+                workflow.worker.join(5)
+                expected += delta
+                self.assertEqual(client.status()["pos"]["z"], expected)
+            with self.assertRaisesRegex(RobotError, "allowed jog increment"):
+                workflow.launch("jog", data=dict(client.status(), axis="j1", delta=100))
+            client.motion("move", {"axis": "z", "to": -1700, "feed": 2000}, Event())
+            with self.assertRaisesRegex(RobotError, "outside the commissioned step bounds"):
+                workflow.launch("z-jog", data=dict(client.status(), axis="z", delta=-500))
+            self.assertEqual(client.status()["pos"]["z"], -1700)
+
     def test_prehome_nudges_are_limited_and_do_not_establish_home(self):
         with server(controller=Controller(move_seconds=.02)) as (url, token):
             session = Session(Namespace(verify=False), None)

@@ -102,3 +102,11 @@ commands and pre-home bench testing.
 Run `python3 -m unittest discover -s tests -v` to regression-test the nominal print
 and inspection path from rasterized PDFs (`pdftoppm`, from `poppler-utils`, is required
 for these tests).
+
+## Mimicry: separate hand-control dashboard
+
+Run **`./startmimicry.sh --install-model`** once, then **`./startmimicry.sh`**.
+Open **http://127.0.0.1:8081/**. The default uses the USB camera with a simulated
+robot. Use `./startmimicry.sh --no-camera` to try it with arrow keys and Space
+instead. Mimicry doesn't scan fixtures or control the drill. See the
+[Mimicry setup guide](Docs/mimicry.md) for gestures, Set Z Zero, and hardware setup.

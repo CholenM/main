@@ -3,6 +3,11 @@
 // Opt in only after verifying pre-home test poses and the hardwired stop.
 #define SCARA_ENABLE_PREHOME_NUDGE 0
 
+// Mimicry is off by default. In the local profile, set a measured limit in
+// microsteps above the bottom contact (at most 136062 for this rig). Verify
+// the transmission, switch release, direction, and clearance before enabling.
+#define SCARA_MIMIC_Z_MAX_STEPS 0
+
 // Status-only by default. Copy to machine_config.h for commissioning.
 //
 // Z is a bounded, unreferenced step axis: pos.z = 0 is the boot datum, not a

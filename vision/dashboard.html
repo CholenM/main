@@ -118,7 +118,7 @@ footer{margin-top:12px;color:var(--muted);font-size:12px}
               <small id="park-pose">Park not configured</small>
             </div>
             <div id="manual-moves" class="manual" hidden>
-              <label id="jog-size">Jog increment (steps)
+              <label id="jog-size">J1/J2 jog increment (steps)
                 <select id="jog-step"><option>10</option><option>25</option><option>50</option></select>
               </label>
               <div class="actions">
@@ -134,6 +134,9 @@ footer{margin-top:12px;color:var(--muted);font-size:12px}
               </div>
               <small>Verify camera clearance and the full J1 → J2 path before saving or returning to park.</small>
               <div class="actions">
+                <label id="z-jog-size">Z jog increment (steps)
+                  <select id="z-jog-step"><option>10</option><option>25</option><option>50</option><option>100</option><option>500</option><option>1000</option></select>
+                </label>
                 <button type="button" id="z-minus" disabled>Z −</button>
                 <button type="button" id="z-plus" disabled>Z +</button>
                 <button type="button" id="drill-toggle" aria-pressed="false" disabled>Drill off</button>
@@ -373,7 +376,7 @@ function renderRobot() {
   const zBounds = bounds?.z;
   const hasZBounds = Array.isArray(zBounds) && zBounds.length === 2 &&
     zBounds.every(Number.isInteger);
-  const zStep = Number($('jog-step').value);
+  const zStep = Number($('z-jog-step').value);
   const zReady = readyStage && status?.commissioned && status?.z_mode === 'bounded' &&
     w.manual_enabled && hasZBounds;
   const drillReady = readyStage && w.manual_enabled &&
@@ -399,6 +402,7 @@ function renderRobot() {
   $('home-only').disabled = !idle || status?.limits?.z !== 1;
   $('manual-moves').hidden = !w.manual_enabled;
   const virtualReady = !!virtual && !w.busy && !robotPending && ['IDLE','DONE','REVIEW'].includes(w.stage);
+  $('z-jog-size').hidden = !!virtual;
   $('z-minus').disabled = virtual ? (!virtualReady || virtual.z_steps <= 0) :
     !(zReady && status.pos.z - zStep >= zBounds[0] && status.limits?.z === 1);
   $('z-plus').disabled = virtual ? (!virtualReady || virtual.z_steps >= 100) :
@@ -503,10 +507,10 @@ $('robot-action').onclick = () => command(robotAction);
 $('robot-stop').onclick = () => command('stop');
 $('z-minus').onclick = () => state?.workflow?.simulated
   ? command('virtual-z', {delta:-10})
-  : command('z-jog', {axis:'z', delta:-Number($('jog-step').value)});
+  : command('z-jog', {axis:'z', delta:-Number($('z-jog-step').value)});
 $('z-plus').onclick = () => state?.workflow?.simulated
   ? command('virtual-z', {delta:10})
-  : command('z-jog', {axis:'z', delta:Number($('jog-step').value)});
+  : command('z-jog', {axis:'z', delta:Number($('z-jog-step').value)});
 $('drill-toggle').onclick = () => state?.workflow?.simulated
   ? command('virtual-drill', {on:!state?.workflow?.virtual_tools?.drill})
   : command('drill', {on:!state?.workflow?.status?.spindle});
@@ -537,6 +541,7 @@ $('return-park').onclick = () => {
   }
 };
 $('jog-step').onchange = controls;
+$('z-jog-step').onchange = controls;
 for (const button of document.querySelectorAll('[data-joint]')) {
   button.onclick = () => {
     const w = state?.workflow;

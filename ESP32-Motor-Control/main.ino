@@ -29,6 +29,13 @@ struct Axis {
 #ifndef SCARA_ENABLE_PREHOME_NUDGE
 #define SCARA_ENABLE_PREHOME_NUDGE 0
 #endif
+#ifndef SCARA_MIMIC_Z_MAX_STEPS
+#define SCARA_MIMIC_Z_MAX_STEPS 0
+#endif
+constexpr int32_t MIMIC_Z_MAX = SCARA_MIMIC_Z_MAX_STEPS;
+static_assert(MIMIC_Z_MAX >= 0 && MIMIC_Z_MAX <= 136062, "Invalid bottom-referenced Z limit");
+constexpr int32_t MIMIC_Z_CHUNK = 30, MIMIC_J1_CHUNK = 8, MIMIC_SWITCH_RELEASE_STEPS = 400;
+constexpr uint32_t MIMIC_LEASE_MS = 250;
 constexpr int32_t NUDGE_STEPS = 10, NUDGE_BUDGET = 30;
 
 enum State { IDLE, HOMING, MOVING, HOLD, FAULT, ESTOP };
@@ -45,6 +52,8 @@ constexpr int J1 = 1, J2 = 2;
 struct Motion {
   State state = IDLE;
   bool homed = false, pulse = false, debouncing = false;
+  bool zReferenced = false, zMustRezero = false, mimicChunk = false, zPressed = false;
+  uint32_t zPressedSince = 0;
   int axis = 0, sign = 0;
   int32_t pos[3] = {}, target[3] = {}, remaining = 0;
   uint32_t command = 0, lease = 0, nextEdge = 0, feed = HOME_FEED_US, changedAt = 0;
@@ -147,6 +156,13 @@ void halt(State state, const char* fault) {
   motion.state = state;
   motion.fault = fault;
   motion.homed = false;
+  if (motion.zReferenced) {
+    // The old boot-relative datum was overwritten; require a new zero instead
+    // of falling back to legacy unreferenced targets with a stale count.
+    motion.zReferenced = false;
+    motion.zMustRezero = true;
+  }
+  motion.mimicChunk = false;
   motion.pulse = false;
   ++motion.command;
 }
@@ -189,8 +205,11 @@ bool stable(int axis, bool expected, uint32_t now) {
 }
 
 void tick(bool connected) {
-  if (!active()) return;
   const uint32_t now = millis();
+  const bool bottom = triggered(Z);
+  if (bottom && !motion.zPressed) motion.zPressedSince = now;
+  motion.zPressed = bottom;
+  if (!active()) return;
   if (static_cast<int32_t>(now - motion.lease) >= 0 || !connected) {
     halt(FAULT, "HEARTBEAT");  // No uncommanded retraction in this spindle-off release.
     return;
@@ -198,22 +217,32 @@ void tick(bool connected) {
   // The bottom contact stops downward Z only. Upward Z may leave a pressed
   // switch so the tool can be raised; there is no upper switch.
   if (motion.state == HOMING) {
-    if (triggered(Z)) {
+    if (bottom) {
       halt(FAULT, "Z_BOTTOM_LIMIT");
       return;
     }
   } else if (motion.axis == Z) {
-    if (triggered(Z) && motion.sign < 0) {
+    if (bottom && motion.sign < 0) {
+      if (motion.zReferenced && motion.pos[Z] != 0) {
+        halt(FAULT, "Z_REFERENCE_LOST");
+        return;
+      }
       // The bottom contact ends a downward Z move without invalidating the
       // rotary datum. The operator can then jog Z+ to lift off the switch.
       digitalWrite(AXES[Z].stepPin, LOW);
       motion.pulse = false;
       motion.target[Z] = motion.pos[Z];
       motion.state = IDLE;
+      motion.mimicChunk = false;
       motion.fault = "Z_BOTTOM_LIMIT";
       return;
     }
-  } else if (triggered(Z)) {
+    if (bottom && motion.zReferenced && motion.sign > 0 &&
+        motion.pos[Z] >= MIMIC_SWITCH_RELEASE_STEPS) {
+      halt(FAULT, "Z_SWITCH_NOT_RELEASED");
+      return;
+    }
+  } else if (bottom) {
     halt(FAULT, "Z_BOTTOM_LIMIT");
     return;
   }
@@ -244,6 +273,7 @@ void tick(bool connected) {
   }
   if (motion.state == MOVING && motion.pos[i] == motion.target[i]) {
     motion.state = IDLE;
+    motion.mimicChunk = false;
     return;
   }
   if (motion.state == HOMING) {
@@ -339,6 +369,9 @@ void status() {
   doc["spindle_gpio"] = SPINDLE_PIN;
   doc["drill_lease_ms"] = DRILL_LEASE_MS;
   doc["z_mode"] = "bounded";
+  doc["mimicry"]["enabled"] = MIMIC_Z_MAX > 0 && profileValid && motionTaskReady;
+  doc["mimicry"]["z_referenced"] = current.zReferenced;
+  doc["mimicry"]["z_max_steps"] = MIMIC_Z_MAX;
   doc["commissioned"] = profileValid && motionTaskReady;
   doc["prehome_nudge"]["enabled"] = bool(SCARA_ENABLE_PREHOME_NUDGE) && profileValid && motionTaskReady;
   doc["prehome_nudge"]["step"] = NUDGE_STEPS;
@@ -359,8 +392,8 @@ void status() {
     doc["pos"][name] = current.pos[i];
     doc["target"][name] = current.target[i];
     doc["limits"][name] = triggered(i) ? 0 : 1;
-    doc["bounds"][name][0] = AXES[i].minSteps;
-    doc["bounds"][name][1] = AXES[i].maxSteps;
+    doc["bounds"][name][0] = i == Z && current.zReferenced ? 0 : AXES[i].minSteps;
+    doc["bounds"][name][1] = i == Z && current.zReferenced ? MIMIC_Z_MAX : AXES[i].maxSteps;
   }
   reply(200, doc);
 }
@@ -381,13 +414,16 @@ void command() {
   int32_t target = input["to"].as<int32_t>();
   uint32_t feed = input["feed"].as<uint32_t>();
   const bool nudge = path == "/nudge";
+  const bool mimic = path == "/mimic-jog", zero = path == "/z-zero";
   const int32_t delta = input["delta"].as<int32_t>();
   const bool validNudge = (axis == J1 || axis == J2) && input["delta"].is<int32_t>() &&
       (delta == NUDGE_STEPS || delta == -NUDGE_STEPS) &&
       input["clearance_confirmed"].is<bool>() && input["clearance_confirmed"].as<bool>();
   const bool validMove = (axis == Z || axis == J1 || axis == J2) && input["to"].is<int32_t>() &&
-      input["feed"].is<uint32_t>() && feed >= MIN_FEED_US && feed <= MAX_FEED_US &&
-      target >= AXES[axis].minSteps && target <= AXES[axis].maxSteps;
+       input["feed"].is<uint32_t>() && feed >= MIN_FEED_US && feed <= MAX_FEED_US;
+  const int32_t chunk = axis == Z ? MIMIC_Z_CHUNK : MIMIC_J1_CHUNK;
+  const bool validMimic = (axis == Z || axis == J1) && input["delta"].is<int32_t>() &&
+      delta != 0 && delta >= -chunk && delta <= chunk;
   const bool matchingBoot = strcmp(input["boot"] | "", bootId) == 0;
   const bool validHeartbeat = input["command_id"].is<uint32_t>();
   uint32_t expected = input["command_id"].as<uint32_t>();
@@ -407,7 +443,7 @@ void command() {
       halt(FAULT, "HEARTBEAT");
       error = "HEARTBEAT_EXPIRED";
     } else {
-      if (active()) motion.lease = millis() + LEASE_MS;
+      if (active() && !motion.mimicChunk) motion.lease = millis() + LEASE_MS;
       if (drillOn) drillLease = millis() + DRILL_LEASE_MS;
     }
   } else if (path == "/drill" && input["on"].is<bool>()) {
@@ -425,10 +461,44 @@ void command() {
   } else if (path == "/spindle" && input["on"].is<bool>()) {
     digitalWrite(SPINDLE_PIN, LOW);
     if (input["on"].as<bool>()) error = "SPINDLE_DISABLED";
-  } else if ((path == "/home" || path == "/move" || nudge) && motion.state == IDLE) {
+  } else if ((path == "/home" || path == "/move" || nudge || mimic || zero) && motion.state == IDLE) {
     if (!profileValid || !motionTaskReady) error = "NOT_COMMISSIONED";
     else if (!validHeartbeat || !matchingBoot || motion.command != expected) error = "COMMAND_CHANGED";
-    else if (path == "/home") {
+    else if (mimic || zero) {
+      if (MIMIC_Z_MAX == 0) error = "MIMICRY_DISABLED";
+      else if (drillOn) error = "DRILL_ACTIVE";
+      else if (zero) {
+        if (!triggered(Z) || !motion.zPressed || millis() - motion.zPressedSince < DEBOUNCE_MS)
+          error = "Z_BOTTOM_SWITCH_NOT_ACTIVE";
+        else {
+          motion.pos[Z] = motion.target[Z] = 0;
+          motion.zReferenced = true;
+          motion.zMustRezero = false;
+          motion.fault = nullptr;
+          ++motion.command;
+        }
+      } else if (!validMimic) { error = "INVALID_MIMIC_JOG"; code = 400; }
+      else if (!motion.zReferenced) error = "Z_NOT_REFERENCED";
+      else {
+        const bool bottom = triggered(Z);
+        target = motion.pos[axis] + delta;
+        const int32_t low = axis == Z ? 0 : AXES[J1].minSteps;
+        const int32_t high = axis == Z ? MIMIC_Z_MAX : AXES[J1].maxSteps;
+        if (target < low || target > high) error = "MIMIC_TRAVEL_LIMIT";
+        else if (axis == Z && bottom && delta < 0) error = "Z_BOTTOM_LIMIT";
+        else if (axis == J1 && (!motion.homed || bottom)) error = "NOT_HOMED_OR_SAFE_Z";
+        else if (axis == J1 && (triggered(J1) || triggered(J2))) error = "JOINT_LIMIT_ACTIVE";
+        else {
+          motion.axis = axis;
+          motion.target[axis] = target;
+          motion.state = MOVING;
+          motion.mimicChunk = true;
+          motion.fault = nullptr;
+          direction(delta > 0 ? 1 : -1, axis == Z ? 1000 : 3000);
+          code = 202;
+        }
+      }
+    } else if (path == "/home") {
       if (triggered(Z)) error = "Z_BOTTOM_LIMIT";
       else {
         digitalWrite(SPINDLE_PIN, LOW);
@@ -459,10 +529,14 @@ void command() {
         direction(delta > 0 ? 1 : -1, LATCH_FEED_US);
         code = 202;
       }
-    } else if (!validMove) { error = "INVALID_TARGET_OR_FEED"; code = 400; }
+    } else if (!validMove || target < (axis == Z && motion.zReferenced ? 0 : AXES[axis].minSteps) ||
+               target > (axis == Z && motion.zReferenced ? MIMIC_Z_MAX : AXES[axis].maxSteps)) {
+      error = "INVALID_TARGET_OR_FEED"; code = 400;
+    }
     else if (axis != Z && !motion.homed) error = "NOT_HOMED";
     else if (axis == Z) {
-      if (triggered(Z) && target < motion.pos[Z]) error = "Z_BOTTOM_LIMIT";
+      if (motion.zMustRezero) error = "Z_NOT_REFERENCED";
+      else if (triggered(Z) && target < motion.pos[Z]) error = "Z_BOTTOM_LIMIT";
       else {
         digitalWrite(SPINDLE_PIN, LOW);
         drillOn = false;
@@ -489,7 +563,7 @@ void command() {
     }
     if (code == 202) {
       ++motion.command;
-      motion.lease = millis() + LEASE_MS;
+      motion.lease = millis() + (motion.mimicChunk ? MIMIC_LEASE_MS : LEASE_MS);
     }
   } else {
     error = "INVALID_STATE_OR_COMMAND";
@@ -534,7 +608,7 @@ void setup() {
   server.collectHeaders(headers, 1);
   server.on("/status", HTTP_GET, status);
   const char* commands[] = {"/home", "/move", "/nudge", "/heartbeat", "/stop", "/estop", "/reset",
-                            "/spindle", "/drill"};
+                            "/spindle", "/drill", "/z-zero", "/mimic-jog"};
   for (const char* path : commands) server.on(path, HTTP_POST, command);
   server.onNotFound([]() { failure(404, "UNKNOWN_ENDPOINT"); });
   WiFi.mode(WIFI_STA);

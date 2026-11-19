@@ -4,3 +4,5 @@ __pycache__/
 Docs/print
 /ESP32-Motor-Control/secrets.h
 /ESP32-Motor-Control/machine_config.h
+/mimicry/model/
+/mimicry/.venv/

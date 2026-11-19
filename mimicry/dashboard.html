@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="mimicry-key" content="__MIMICRY_KEY__">
+  <meta name="mimicry-virtual" content="__MIMICRY_VIRTUAL__">
+  <title>SCARA Mimicry</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #10161e; color: #edf3fa; }
+    body { margin: 0 auto; max-width: 68rem; padding: 1.5rem; }
+    header, .buttons { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; }
+    header { justify-content: space-between; }
+    h1 { margin: 0; }
+    .badge { border: 1px solid #70889d; border-radius: 2rem; padding: .35rem .75rem; }
+    main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(16rem, 1fr); gap: 1rem; }
+    section { background: #192431; border-radius: .9rem; padding: 1rem; }
+    canvas { width: 100%; height: auto; background: #0d131a; border-radius: .5rem; display: block; }
+    button { font: inherit; padding: .6rem .85rem; cursor: pointer; border-radius: .45rem;
+      background: #253c50; color: inherit; border: 1px solid #658098; }
+    button:disabled { opacity: .5; cursor: default; }
+    #estop { background: #782c34; border-color: #f17683; }
+    #arm:not(:disabled) { background: #19503f; border-color: #61d4ac; }
+    #error { color: #ffb7ad; min-height: 1.4em; }
+    #message { min-height: 2.5em; }
+    .muted { color: #bbcbd9; }
+    dl { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; }
+    dd { margin: 0; text-align: right; }
+    @media (max-width: 50rem) { main { grid-template-columns: 1fr; } }
+  </style>
+  <script type="module" src="/ui.mjs"></script>
+</head>
+<body>
+  <header><h1>SCARA Mimicry</h1><span class="badge" id="mode">Connecting…</span></header>
+  <p class="muted">Left/right jogs J1. Up/down jogs Z. Gestures never move J2.</p>
+  <main>
+    <section aria-label="Joystick preview">
+      <canvas id="preview" width="640" height="480" aria-label="Palm location and joystick center"></canvas>
+      <p id="input" class="muted">Starting hand tracking…</p>
+      <p id="tracking" class="muted" hidden></p>
+      <div class="buttons">
+        <button id="center" disabled>Set Joystick Center</button>
+        <button id="arm" disabled>Arm Gestures</button>
+        <button id="disarm" disabled>Disarm</button>
+      </div>
+      <p id="message" role="status">Connecting to controller…</p>
+      <p id="error" role="alert"></p>
+    </section>
+    <section aria-label="Robot status and setup">
+      <h2>Robot setup</h2>
+      <p>Bring Z to the bottom switch, select <strong>Set Z Zero</strong>, then use an upward gesture to clear the switch before rotary homing.</p>
+      <div class="buttons">
+        <button id="zero" disabled>Set Z Zero</button>
+        <button id="home" disabled>Home J1 + J2</button>
+        <button id="reset" disabled>Reset Controller</button>
+        <button id="estop">Network E-stop</button>
+      </div>
+      <dl id="status"></dl>
+      <p class="muted">Center or a closed fist stops sending jogs. A fist or lost tracking disarms gestures. Keep clear and use the hardwired E-stop for emergencies.</p>
+    </section>
+  </main>
+</body>
+</html>

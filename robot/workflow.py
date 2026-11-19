@@ -10,6 +10,7 @@ from .home_trace import HomeTrace
 
 JOINTS = ("j1", "j2")
 JOG_STEPS = (10, 25, 50)
+Z_JOG_STEPS = (*JOG_STEPS, 100, 500, 1000)
 MANUAL_FEED_US = 5000
 READY_STAGES = ("IDLE", "DONE", "REVIEW")
 
@@ -176,7 +177,7 @@ class Workflow:
                 axis, delta = data.get("axis"), data.get("delta")
                 if action in ("jog", "z-jog", "nudge"):
                     if action == "z-jog":
-                        if axis != "z" or type(delta) is not int or abs(delta) not in JOG_STEPS:
+                        if axis != "z" or type(delta) is not int or abs(delta) not in Z_JOG_STEPS:
                             raise RobotError("Select Z and an allowed jog increment.")
                     else:
                         allowed = (10,) if action == "nudge" else JOG_STEPS

@@ -8,6 +8,9 @@ and toggle the drill relay.
 The bench rig has a bottom Z switch but **no upper Z switch and no Z homing phase**.
 `pos.z = 0` is the boot datum, not a measured height.
 No USB camera, calibration, or robot is needed to try the simulator workflow.
+The optional [Mimicry mode](mimicry.md) adds a manual, switch-verified Z reference
+through `/z-zero` and a separate bounded `/mimic-jog` command. The normal boot
+datum behavior is unchanged when this option is disabled.
 
 ## Labels and coordinate conventions
 
@@ -168,14 +171,15 @@ Manual controls do not require a park pose, tags, a reference CSV or calibration
 Use **Home J1/J2** to establish the joint step reference for normal jogs, or
 follow the [pre-home bench procedure](command-guide.md#pre-home-bench-test).
 The controller must be commissioned for motion and have clear limits for J1/J2.
-Normal jog commands are single moves of 10, 25, or
+Normal J1/J2 jog commands are single moves of 10, 25, or
 50 steps at a fixed feed; there is no hold-to-repeat, and a move outside verified
 firmware step bounds is rejected rather than clipped. The limits do not detect
 obstacles. **Return to park** moves J1, then J2; verify the entire path before
 commanding it. A manual move or changing park clears any pending plan.
 
-**Z − / Z +** sends an unreferenced absolute step target within `bounds.z`. It does
-not require homing. **Z +** may lift off a pressed bottom switch; **Z −** is disabled
+**Z − / Z +** has its own selector for 10, 25, 50, 100, 500, or 1000 steps.
+It sends an absolute step target within `bounds.z` and does not require rotary
+homing. **Z +** may lift off a pressed bottom switch; **Z −** is disabled
 while the bottom switch is pressed. There is no upper switch, so verify the upward
 direction and bound first. A reboot resets `pos.z` to zero without moving the tool.
 

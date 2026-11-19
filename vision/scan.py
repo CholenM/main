@@ -20,15 +20,17 @@ class ScanError(Exception):
     pass
 
 
-def open_camera(camera):
+def open_camera(camera, *, size=(1920, 1080), fps=None):
     device = int(camera) if camera.isdecimal() else camera
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
         cap.release()
         raise ScanError(f"Cannot open camera {camera}; check the device, permissions and other camera apps.")
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+    if fps is not None:
+        cap.set(cv2.CAP_PROP_FPS, fps)
     return cap
 
 

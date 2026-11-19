@@ -16,7 +16,7 @@ BOUNDS = {"z": (-2000, 2000), "j1": (-10000, 10000), "j2": (-10000, 10000)}
 
 
 class Controller:
-    def __init__(self, move_seconds=0.20, lease_seconds=2.0, drill_seconds=2.5):
+    def __init__(self, move_seconds=0.20, lease_seconds=2.0, drill_seconds=2.5, mimic_z_max=0):
         self.lock = Lock()
         self.boot = uuid.uuid4().hex
         self.command = 0
@@ -30,6 +30,8 @@ class Controller:
         self.nudge_remaining = 30
         self.move_seconds, self.lease_seconds = move_seconds, lease_seconds
         self.drill_seconds = drill_seconds
+        self.mimic_z_max = mimic_z_max
+        self.z_referenced = self.z_must_rezero = self.mimic_chunk = False
 
     def handle(self, path, body=None):
         with self.lock:
@@ -42,15 +44,20 @@ class Controller:
                     if self.state == "HOMING":
                         self.homed = True
                     self.state = "IDLE"
+                    self.mimic_chunk = False
             if self.drill and self.drill_until <= now:
                 self.drill = False
+            bottom = self.z_bottom or (self.mimic_z_max > 0 and self.pos["z"] <= 0)
+            bounds = BOUNDS | ({"z": (0, self.mimic_z_max)} if self.z_referenced else {})
             if path == "/status" and body is None:
                 return 200, {"fw": VERSION, "boot": self.boot, "command_id": self.command,
                              "state": self.state, "homed": self.homed, "pos": self.pos.copy(),
-                             "target": self.target.copy(), "limits": dict.fromkeys(AXES, 1),
+                             "target": self.target.copy(), "limits": {"z": int(not bottom), "j1": 1, "j2": 1},
                              "spindle": self.drill, "spindle_gpio": 23,
                              "drill_lease_ms": 2500, "fault": self.fault, "commissioned": True,
-                              "simulator": True, "z_mode": "bounded", "bounds": BOUNDS,
+                               "simulator": True, "z_mode": "bounded", "bounds": bounds,
+                               "mimicry": {"enabled": self.mimic_z_max > 0,
+                                           "z_referenced": self.z_referenced, "z_max_steps": self.mimic_z_max},
                               "prehome_nudge": {"enabled": True, "step": 10,
                                                 "remaining": self.nudge_remaining},
                               "home_axis": "j1" if self.state == "HOMING" else None,
@@ -60,7 +67,7 @@ class Controller:
             if path == "/heartbeat":
                 if (body.get("boot"), body.get("command_id")) != (self.boot, self.command):
                     return 409, {"error": "COMMAND_CHANGED"}
-                if self.state in ("HOMING", "MOVING"):
+                if self.state in ("HOMING", "MOVING") and not self.mimic_chunk:
                     self.lease = now + self.lease_seconds
                 if self.drill:
                     self.drill_until = now + self.drill_seconds
@@ -89,13 +96,45 @@ class Controller:
             if path == "/reset" and self.state in ("HOLD", "FAULT", "ESTOP"):
                 self.halt("IDLE", None)
                 return 200, self.ack()
+            if path in ("/z-zero", "/mimic-jog") and self.state == "IDLE":
+                if (body.get("boot"), body.get("command_id")) != (self.boot, self.command):
+                    return 409, {"error": "COMMAND_CHANGED"}
+                if not self.mimic_z_max or self.drill:
+                    return 409, {"error": "MIMICRY_DISABLED" if not self.mimic_z_max else "DRILL_ACTIVE"}
+                if path == "/z-zero":
+                    if not bottom:
+                        return 409, {"error": "Z_BOTTOM_SWITCH_NOT_ACTIVE"}
+                    self.pos["z"] = self.target["z"] = 0
+                    self.z_referenced, self.z_must_rezero, self.fault = True, False, None
+                    self.command = (self.command + 1) % 2**32
+                    return 200, self.ack()
+                axis, delta = body.get("axis"), body.get("delta")
+                if (axis not in ("j1", "z") or type(delta) is not int or
+                        not 1 <= abs(delta) <= (30 if axis == "z" else 8)):
+                    return 400, {"error": "INVALID_MIMIC_JOG"}
+                if not self.z_referenced:
+                    return 409, {"error": "Z_NOT_REFERENCED"}
+                target = self.pos[axis] + delta
+                if not bounds[axis][0] <= target <= bounds[axis][1]:
+                    return 409, {"error": "MIMIC_TRAVEL_LIMIT"}
+                if axis == "j1" and (not self.homed or bottom):
+                    return 409, {"error": "NOT_HOMED_OR_SAFE_Z"}
+                if axis == "z" and bottom and delta < 0:
+                    return 409, {"error": "Z_BOTTOM_LIMIT"}
+                self.target = self.pos | {axis: target}
+                self.state, self.fault, self.mimic_chunk = "MOVING", None, True
+                self.finish, self.lease = now+self.move_seconds, now+0.25
+                self.command = (self.command + 1) % 2**32
+                return 202, self.ack()
             if path in ("/home", "/move", "/nudge") and self.state == "IDLE":
                 if (body.get("boot"), body.get("command_id")) != (self.boot, self.command):
                     return 409, {"error": "COMMAND_CHANGED"}
                 if path == "/home":
+                    if self.mimic_z_max and bottom:
+                        return 409, {"error": "Z_BOTTOM_LIMIT"}
                     self.state, self.homed = "HOMING", False
                     self.drill, self.drill_until = False, 0
-                    self.target = dict.fromkeys(AXES, 0)
+                    self.target = self.pos | {"j1": 0, "j2": 0}
                 elif path == "/nudge":
                     axis, delta = body.get("axis"), body.get("delta")
                     if (axis not in ("j1", "j2") or type(delta) is not int or
@@ -113,10 +152,12 @@ class Controller:
                     axis, target, feed = (body.get(k) for k in ("axis", "to", "feed"))
                     if (axis not in AXES or type(target) is not int or type(feed) is not int
                             or not 1000 <= feed <= 20000
-                            or not BOUNDS[axis][0] <= target <= BOUNDS[axis][1]):
+                            or not bounds[axis][0] <= target <= bounds[axis][1]):
                         return 400, {"error": "INVALID_TARGET_OR_FEED"}
                     if axis != "z" and not self.homed:
                         return 409, {"error": "NOT_HOMED_OR_SAFE_Z"}
+                    if axis == "z" and self.z_must_rezero:
+                        return 409, {"error": "Z_NOT_REFERENCED"}
                     self.drill, self.drill_until = False, 0
                     if axis == "z" and self.z_bottom and target < self.pos["z"]:
                         self.state, self.fault = "IDLE", "Z_BOTTOM_LIMIT"
@@ -137,6 +178,8 @@ class Controller:
         self.state, self.fault, self.homed = state, fault, False
         self.drill, self.drill_until = False, 0
         self.target = self.pos.copy()
+        self.z_must_rezero |= self.z_referenced
+        self.z_referenced = self.mimic_chunk = False
 
 
 class Handler(BaseHTTPRequestHandler):
