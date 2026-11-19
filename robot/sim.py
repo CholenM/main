@@ -1,4 +1,4 @@
-"""HTTP simulator for the same spindle-disabled controller contract."""
+"""HTTP simulator for the same bounded-Z and drill-relay controller contract."""
 
 import argparse
 import json
@@ -12,20 +12,24 @@ from threading import Lock, Thread
 
 from .client import AXES, VERSION
 
-BOUNDS = {"z": (0, 0), "j1": (-10000, 10000), "j2": (-10000, 10000)}
+BOUNDS = {"z": (-2000, 2000), "j1": (-10000, 10000), "j2": (-10000, 10000)}
 
 
 class Controller:
-    def __init__(self, move_seconds=0.20, lease_seconds=2.0):
+    def __init__(self, move_seconds=0.20, lease_seconds=2.0, drill_seconds=2.5):
         self.lock = Lock()
         self.boot = uuid.uuid4().hex
         self.command = 0
         self.pos = dict.fromkeys(AXES, 0)
         self.target = self.pos.copy()
         self.state, self.homed, self.fault = "IDLE", False, None
+        self.drill = False
+        self.drill_until = 0
+        self.z_bottom = False
         self.finish = self.lease = 0
         self.nudge_remaining = 30
         self.move_seconds, self.lease_seconds = move_seconds, lease_seconds
+        self.drill_seconds = drill_seconds
 
     def handle(self, path, body=None):
         with self.lock:
@@ -38,12 +42,15 @@ class Controller:
                     if self.state == "HOMING":
                         self.homed = True
                     self.state = "IDLE"
+            if self.drill and self.drill_until <= now:
+                self.drill = False
             if path == "/status" and body is None:
                 return 200, {"fw": VERSION, "boot": self.boot, "command_id": self.command,
                              "state": self.state, "homed": self.homed, "pos": self.pos.copy(),
                              "target": self.target.copy(), "limits": dict.fromkeys(AXES, 1),
-                             "spindle": False, "fault": self.fault, "commissioned": True,
-                              "simulator": True, "z_mode": "fixed", "bounds": BOUNDS,
+                             "spindle": self.drill, "spindle_gpio": 23,
+                             "drill_lease_ms": 2500, "fault": self.fault, "commissioned": True,
+                              "simulator": True, "z_mode": "bounded", "bounds": BOUNDS,
                               "prehome_nudge": {"enabled": True, "step": 10,
                                                 "remaining": self.nudge_remaining},
                               "home_axis": "j1" if self.state == "HOMING" else None,
@@ -55,8 +62,23 @@ class Controller:
                     return 409, {"error": "COMMAND_CHANGED"}
                 if self.state in ("HOMING", "MOVING"):
                     self.lease = now + self.lease_seconds
+                if self.drill:
+                    self.drill_until = now + self.drill_seconds
+                return 200, self.ack()
+            if path == "/drill" and type(body.get("on")) is bool:
+                if not body["on"]:
+                    self.drill = False
+                    self.drill_until = 0
+                elif body.get("boot") != self.boot:
+                    return 409, {"error": "COMMAND_CHANGED"}
+                elif self.state != "IDLE":
+                    return 409, {"error": "INVALID_STATE_OR_COMMAND"}
+                else:
+                    self.drill = True
+                    self.drill_until = now + self.drill_seconds
                 return 200, self.ack()
             if path == "/spindle" and type(body.get("on")) is bool:
+                self.drill = False
                 return (409, {"error": "SPINDLE_DISABLED"}) if body["on"] else (200, self.ack())
             if path == "/stop" and self.state not in ("FAULT", "ESTOP"):
                 self.halt("HOLD", "STOP")
@@ -72,11 +94,10 @@ class Controller:
                     return 409, {"error": "COMMAND_CHANGED"}
                 if path == "/home":
                     self.state, self.homed = "HOMING", False
+                    self.drill, self.drill_until = False, 0
                     self.target = dict.fromkeys(AXES, 0)
                 elif path == "/nudge":
                     axis, delta = body.get("axis"), body.get("delta")
-                    if axis == "z":
-                        return 400, {"error": "Z_FIXED"}
                     if (axis not in ("j1", "j2") or type(delta) is not int or
                             abs(delta) != 10 or body.get("clearance_confirmed") is not True):
                         return 400, {"error": "INVALID_NUDGE_OR_CLEARANCE"}
@@ -85,20 +106,24 @@ class Controller:
                     if self.nudge_remaining < 10:
                         return 409, {"error": "NUDGE_BUDGET_EXHAUSTED"}
                     self.nudge_remaining -= 10
+                    self.drill, self.drill_until = False, 0
                     self.state = "MOVING"
                     self.target = self.pos | {axis: self.pos[axis] + delta}
                 else:
                     axis, target, feed = (body.get(k) for k in ("axis", "to", "feed"))
-                    if axis == "z":
-                        return 400, {"error": "Z_FIXED"}
-                    if (axis not in ("j1", "j2") or type(target) is not int or type(feed) is not int
+                    if (axis not in AXES or type(target) is not int or type(feed) is not int
                             or not 1000 <= feed <= 20000
                             or not BOUNDS[axis][0] <= target <= BOUNDS[axis][1]):
                         return 400, {"error": "INVALID_TARGET_OR_FEED"}
-                    if not self.homed or self.pos["z"] != 0:
+                    if axis != "z" and not self.homed:
                         return 409, {"error": "NOT_HOMED_OR_SAFE_Z"}
-                    self.state = "MOVING"
-                    self.target = self.pos | {axis: target}
+                    self.drill, self.drill_until = False, 0
+                    if axis == "z" and self.z_bottom and target < self.pos["z"]:
+                        self.state, self.fault = "IDLE", "Z_BOTTOM_LIMIT"
+                        self.target = self.pos.copy()
+                    else:
+                        self.state, self.fault = "MOVING", None
+                        self.target = self.pos | {axis: target}
                 self.command = (self.command + 1) % 2**32
                 self.finish, self.lease = now+self.move_seconds, now+self.lease_seconds
                 return 202, self.ack()
@@ -110,6 +135,7 @@ class Controller:
     def halt(self, state, fault):
         self.command = (self.command + 1) % 2**32
         self.state, self.fault, self.homed = state, fault, False
+        self.drill, self.drill_until = False, 0
         self.target = self.pos.copy()
 
 

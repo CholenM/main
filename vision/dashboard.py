@@ -321,8 +321,8 @@ class Dashboard(BaseHTTPRequestHandler):
                 action = path.removeprefix("/api/robot/")
                 if action == "stop":
                     workflow.stop()
-                elif action in ("execute", "jog", "nudge", "record-pose", "save-park", "return-park",
-                                "virtual-z", "virtual-drill", "source"):
+                elif action in ("execute", "jog", "z-jog", "nudge", "record-pose", "save-park",
+                                "return-park", "drill", "virtual-z", "virtual-drill", "source"):
                     try:
                         data = self.robot_body()
                         if action == "execute" and not isinstance(data["review_id"], str):

@@ -2,8 +2,8 @@
 # SCARA PCB vision MVP
 
 The Jetson measures visible drill targets with a Rapoo USB camera and exports XY coordinates
-in millimetres. This demo does **not** move the arm, drive the spindle, or claim drilling
-accuracy. The printed 235 × 127 mm box uses the measured overall reach dimensions;
+in millimetres. The vision-only demo does **not** move the arm, drive the spindle, or claim
+drilling accuracy. The printed 235 × 127 mm box uses the measured overall reach dimensions;
 it is not a guarantee that every target is reachable.
 
 ## Set up the demo
@@ -90,10 +90,10 @@ Run `./start.sh --serve --simulate-robot` to try **Homing → Scanning → Plann
 Executing → Done** with the local controller simulator. Approve the plan before
 execution. Add `--replay <image-or-run>` for an offline demonstration.
 Standard `--serve` remains vision-only. For physical Mode B (home, park, scan
-and show coordinates) and the manual setup and pose logging tools, see the
+and show coordinates) and the manual setup, Z, drill and pose logging tools, see the
 [controller contract and commissioning guide](Docs/robot-contract.md).
-The sketch ships status-only until the travel profile is verified; the workflow
-never enables the spindle.
+The sketch ships status-only until the travel profile is verified; the vision
+workflow never enables the drill.
 
 For separate J1/J2 control with live camera preview, open `/manual` on the
 robot dashboard. See the [command guide](Docs/command-guide.md) for launch

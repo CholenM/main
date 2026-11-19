@@ -166,7 +166,7 @@ def main():
     robot_group.add_argument("--simulate-robot", action="store_true", help="run workflow against a local fake controller")
     robot_group.add_argument("--robot-url", help="physical controller URL (requires SCARA_ROBOT_TOKEN)")
     parser.add_argument("--park-steps", type=int, nargs=2, metavar=("J1", "J2"),
-                        help="verified camera-clear pose at Z=0; (0,0) explicitly confirms home is park")
+                        help="verified camera-clear J1/J2 pose; (0,0) explicitly confirms home is park")
     parser.add_argument("--calibration", type=Path, help="measured calibration JSON for motion planning")
     parser.add_argument("--enable-hardware-dry-run", action="store_true",
                         help="permit raised-tool moves after calibration and operator approval")

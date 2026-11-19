@@ -289,9 +289,9 @@ function renderRobot() {
   if (w?.plan_url) $('plan-file').href = prefix+w.plan_url;
   $('scan').hidden = !!w;
   $('footer').textContent = manualView
-    ? `Fixed Z · ${w?.simulated ? 'Simulation only' : 'Spindle off'} · Manual moves only on this page`
+    ? `Z steps unreferenced · ${w?.simulated ? 'Simulation only' : 'Drill controlled separately'} · Manual moves only on this page`
     : 'Fixture origin: lower-left tag center · X right, Y up · ' +
-      (!w ? 'No robot motion' : w.simulated ? 'Simulation only' : 'Spindle-off commissioning only');
+      (!w ? 'No robot motion' : w.simulated ? 'Simulation only' : 'Dry-run workflow · drill on Manual control');
   document.querySelectorAll('th.robot-column').forEach(th => th.hidden = !w);
   if (!w) return;
   $('robot-status').textContent = w.status ? `${w.simulated ? 'Sim' : 'Robot'} · ${w.status.state}` +
@@ -328,7 +328,7 @@ function renderRobot() {
   const jointText = p => `J1 ${p?.j1 ?? '—'} · J2 ${p?.j2 ?? '—'}`;
   const virtual = w.virtual_tools;
   $('joint-position').textContent =
-    `Z ${virtual ? virtual.z_steps : status ? 'fixed' : '—'} · ${jointText(status?.pos)}`;
+    `Z ${virtual ? virtual.z_steps : status ? status.pos.z : '—'}${virtual ? '' : ' steps'} · ${jointText(status?.pos)}`;
   $('tool-coordinates').textContent = w.tool_xy_mm
     ? `${w.simulated ? 'Simulated' : 'Estimated'} tool XY: ${number(w.tool_xy_mm[0])}, ${number(w.tool_xy_mm[1])} mm`
     : 'Tool XY unavailable outside a homed, calibrated region.';
@@ -341,6 +341,7 @@ function renderRobot() {
   $('robot-diagnostics').textContent = status ?
     [status.homed ? 'Homed' : 'Not homed', `Limits: ${limits.join(' / ')}`,
      status.home_axis && `${status.home_axis.toUpperCase()} ${status.home_phase}`,
+     status.spindle ? 'Drill on' : 'Drill off',
      status.fault].filter(Boolean).join(' · ') : 'Controller offline';
   $('robot-boot').textContent = status ? `Boot: ${status.boot} · Command: ${status.command_id}` : '';
   const trace = w.home_trace;
@@ -358,10 +359,10 @@ function renderRobot() {
     $('home-trace-files').append(link);
   }
   $('park-pose').textContent = w.park_configured ? `Park steps: ${jointText(w.park_steps)}` : 'No park saved (optional for jogging)';
-  const idle = ['IDLE','DONE','REVIEW'].includes(w.stage) && !w.busy && !robotPending &&
-    status?.state === 'IDLE' && status.commissioned && status.simulator === w.simulated;
-  const limitsClear = idle && status.z_mode === 'fixed' && status.pos.z === 0 &&
-    ['z','j1','j2'].every(axis => status.limits?.[axis] === 1);
+  const readyStage = ['IDLE','DONE','REVIEW'].includes(w.stage) && !w.busy && !robotPending &&
+    status?.state === 'IDLE' && status.simulator === w.simulated;
+  const idle = readyStage && status.commissioned;
+  const limitsClear = idle && ['z','j1','j2'].every(axis => status.limits?.[axis] === 1);
   const homed = limitsClear && status.homed;
   const hasBounds = ['j1','j2'].every(axis => Array.isArray(bounds?.[axis]) &&
     bounds[axis].length === 2 && bounds[axis].every(Number.isInteger));
@@ -369,36 +370,51 @@ function renderRobot() {
   const nudge = status?.prehome_nudge;
   const canNudge = limitsClear && !status.homed && w.manual_enabled &&
     nudge?.enabled === true && nudge.step === 10 && nudge.remaining >= nudge.step;
+  const zBounds = bounds?.z;
+  const hasZBounds = Array.isArray(zBounds) && zBounds.length === 2 &&
+    zBounds.every(Number.isInteger);
+  const zStep = Number($('jog-step').value);
+  const zReady = readyStage && status?.commissioned && status?.z_mode === 'bounded' &&
+    w.manual_enabled && hasZBounds;
+  const drillReady = readyStage && w.manual_enabled &&
+    typeof status?.drill_lease_ms === 'number';
   let manualStatus;
   if (!status) manualStatus = 'Waiting for the controller.';
-  else if (!status.commissioned) manualStatus = 'Status-only firmware: motion has not been commissioned.';
+  else if (!status.commissioned) manualStatus = 'J1/J2 and Z motion are not commissioned in this firmware. Drill control is still available.';
   else if (['FAULT','ESTOP','HOLD'].includes(status.state) || ['FAULT','ESTOP'].includes(w.stage))
     manualStatus = 'Resolve the cause, then Reset and Home.';
   else if (w.busy || robotPending || status.state !== 'IDLE') manualStatus = 'Robot action in progress.';
-  else if (status.limits?.z !== 1) manualStatus = 'Z bottom limit is pressed or unavailable.';
+  else if (status.limits?.z !== 1) manualStatus = 'Z bottom limit is pressed. Z+ can lift off; J1/J2 moves are blocked.';
   else if (!status.homed && canNudge) manualStatus = 'Pre-home bench nudges: relative steps only.';
   else if (!status.homed && nudge?.enabled && nudge.remaining < nudge.step)
     manualStatus = 'Pre-home nudge budget exhausted. Do not power-cycle to continue nudging.';
   else if (!status.homed && !limitsClear) manualStatus = 'Clear limit inputs are required for pre-home nudges.';
-  else if (!status.homed) manualStatus = 'Pre-home nudges are not enabled in firmware. Normal jogs require Home.';
-  else if (!w.manual_enabled) manualStatus = 'Jogging is not enabled in this launch mode.';
+  else if (!status.homed) manualStatus = 'Home J1/J2 for joint moves. Z and the drill are available without homing.';
+  else if (!w.manual_enabled) manualStatus = 'Manual control is not enabled in this launch mode.';
   else if (!hasBounds) manualStatus = 'The controller is not reporting verified joint bounds.';
-  else if (!homed) manualStatus = 'A limit is pressed or fixed-Z status is unavailable.';
-  else manualStatus = 'Ready to jog one joint at a time.';
+  else if (!homed) manualStatus = 'A limit is pressed.';
+  else manualStatus = 'Ready to jog one joint at a time. Z and the drill are independent.';
   $('manual-state').textContent = manualStatus;
   $('home-only').textContent = 'Home J1/J2';
   $('home-only').disabled = !idle || status?.limits?.z !== 1;
   $('manual-moves').hidden = !w.manual_enabled;
   const virtualReady = !!virtual && !w.busy && !robotPending && ['IDLE','DONE','REVIEW'].includes(w.stage);
-  $('z-minus').disabled = !virtualReady || virtual.z_steps <= 0;
-  $('z-plus').disabled = !virtualReady || virtual.z_steps >= 100;
-  $('drill-toggle').disabled = !virtualReady;
-  $('drill-toggle').setAttribute('aria-pressed', !!virtual?.drill);
-  $('drill-toggle').textContent = `${virtual ? 'Virtual drill' : `Drill · GPIO ${status?.spindle_gpio ?? 23}`}: ${virtual?.drill ? 'On' : 'Off'}`;
+  $('z-minus').disabled = virtual ? (!virtualReady || virtual.z_steps <= 0) :
+    !(zReady && status.pos.z - zStep >= zBounds[0] && status.limits?.z === 1);
+  $('z-plus').disabled = virtual ? (!virtualReady || virtual.z_steps >= 100) :
+    !(zReady && status.pos.z + zStep <= zBounds[1]);
+  $('drill-toggle').disabled = virtual ? !virtualReady
+    : (status?.spindle ? false : !drillReady);
+  $('drill-toggle').setAttribute('aria-pressed', virtual ? !!virtual?.drill : !!status?.spindle);
+  $('drill-toggle').textContent = virtual
+    ? `Virtual drill: ${virtual?.drill ? 'On' : 'Off'}`
+    : `Drill · GPIO ${status?.spindle_gpio ?? 23}: ${status?.spindle ? 'On' : 'Off'}`;
   $('tools-note').textContent = virtual
     ? 'Virtual Z (steps) and drill only. Neither sends a command to a physical controller.'
-    : 'Hardware Z and drill are locked. The current firmware does not verify Z clearance or a drill interlock.';
-  $('jog-size').hidden = !status?.homed;
+    : 'Physical Z is an unreferenced step axis: 0 is the boot datum, not a height. ' +
+      'Downward motion stops on the bottom switch; there is no upper switch. ' +
+      'The drill has no interlock and drops on Stop, fault, link loss, or heartbeat expiry.';
+  $('jog-size').hidden = !w.manual_enabled;
   $('nudge-budget').textContent = status && !status.homed && nudge?.enabled
     ? `${nudge.step} steps per nudge · ${nudge.remaining} steps remaining · No absolute position` : '';
   $('save-park').disabled = !canMove;
@@ -466,7 +482,7 @@ async function command(action, data) {
   try {
     const options = {method:'POST'};
     if (action === 'execute') data = {review_id:state.workflow.review_id};
-    if (['jog','nudge','save-park','return-park','record-pose'].includes(action)) {
+    if (['jog','z-jog','nudge','save-park','return-park','record-pose','drill'].includes(action)) {
       const status = state?.workflow?.status;
       if (!status) throw Error('Wait for the live joint readout.');
       data = {...data, boot:status.boot, command_id:status.command_id};
@@ -485,9 +501,15 @@ async function command(action, data) {
 }
 $('robot-action').onclick = () => command(robotAction);
 $('robot-stop').onclick = () => command('stop');
-$('z-minus').onclick = () => command('virtual-z', {delta:-10});
-$('z-plus').onclick = () => command('virtual-z', {delta:10});
-$('drill-toggle').onclick = () => command('virtual-drill', {on:!state?.workflow?.virtual_tools?.drill});
+$('z-minus').onclick = () => state?.workflow?.simulated
+  ? command('virtual-z', {delta:-10})
+  : command('z-jog', {axis:'z', delta:-Number($('jog-step').value)});
+$('z-plus').onclick = () => state?.workflow?.simulated
+  ? command('virtual-z', {delta:10})
+  : command('z-jog', {axis:'z', delta:Number($('jog-step').value)});
+$('drill-toggle').onclick = () => state?.workflow?.simulated
+  ? command('virtual-drill', {on:!state?.workflow?.virtual_tools?.drill})
+  : command('drill', {on:!state?.workflow?.status?.spindle});
 $('source-select').onchange = event => command('source', {source:event.target.value});
 $('connect-form').onsubmit = async event => {
   event.preventDefault();

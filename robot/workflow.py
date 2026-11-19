@@ -5,7 +5,7 @@ import math
 import threading
 
 from . import poses
-from .client import RobotError, check_cancelled
+from .client import MotionStopped, RobotError, check_cancelled
 from .home_trace import HomeTrace
 
 JOINTS = ("j1", "j2")
@@ -34,6 +34,7 @@ class Workflow:
         self.before, self.plan, self.boot = None, [], None
         self.directory = None
         self.virtual_z, self.virtual_drill = 0, False
+        self.drill_on, self.drill_stop, self.drill_keepalive = False, threading.Event(), None
 
     def describe(self):
         with self.condition:
@@ -65,6 +66,7 @@ class Workflow:
                                     if self.directory and self.stage == "DONE" else None),
                     "virtual_tools": {"z_steps": self.virtual_z, "drill": self.virtual_drill}
                     if self.simulated else None,
+                    "drill": self.drill_on,
                     "tool_xy_mm": tool_xy,
                     "residual_mm": self.planner.residual_mm if self.planner else None,
                     "can_execute": self.stage == "REVIEW" and self.enable_dry_run and bool(self.plan)}
@@ -73,8 +75,11 @@ class Workflow:
         try:
             status = self.client.status()
             self.status, self.link_error = status, None
+            if self.drill_on and not status.get("spindle"):
+                self.stop_drill_keepalive()
         except RobotError as exc:
             self.status, self.link_error = None, str(exc)
+            self.stop_drill_keepalive()
 
     def transition(self, stage, message=""):
         with self.condition:
@@ -84,20 +89,27 @@ class Workflow:
     def clear_plan(self):
         self.before, self.plan, self.boot, self.directory = None, [], None, None
 
-    def manual_status(self, data, *, prehome=False):
+    def manual_status(self, data, *, prehome=False, axis=None):
         status = self.client.status()
         self.check_controller(status)
-        if status["state"] != "IDLE" or (not prehome and not status["homed"]):
-            raise RobotError("The controller must be idle and homed.")
+        if status["state"] != "IDLE":
+            raise RobotError("The controller must be idle.")
+        if not prehome and axis != "z" and not status["homed"]:
+            raise RobotError("Home J1/J2 before joint moves.")
         if (data.get("boot") != status["boot"] or type(data.get("command_id")) is not int or
                 data["command_id"] != status["command_id"]):
             raise RobotError("The displayed pose is stale. Wait for the live readout and try again.")
         limits = status.get("limits")
-        if (status.get("z_mode") != "fixed" or status["pos"]["z"] != 0 or
-                not isinstance(limits, dict) or
-                any(type(limits.get(axis)) is not int or limits[axis] != 1
-                    for axis in ("z", *JOINTS))):
-            raise RobotError("Fixed-Z status and clear limit inputs are required.")
+        if (not isinstance(limits, dict) or
+                any(type(limits.get(name)) is not int or limits[name] not in (0, 1)
+                    for name in ("z", *JOINTS))):
+            raise RobotError("The controller did not report all three limit inputs.")
+        if axis != "z":
+            if limits["z"] != 1:
+                raise RobotError("Raise Z off the bottom switch before moving J1/J2.")
+            for name in JOINTS:
+                if limits[name] != 1:
+                    raise RobotError(f"{name.upper()} limit is pressed.")
         return status
 
     @staticmethod
@@ -117,6 +129,14 @@ class Workflow:
                 raise RobotError("Scan and execute are unavailable in manual-only mode.")
             if self.worker and self.worker.is_alive():
                 raise RobotError("A workflow action is still finishing.")
+            if action == "drill":
+                if not self.enable_manual and not self.simulated:
+                    raise RobotError("Hardware manual controls are not enabled.")
+                if not (data and data.get("on") is False):
+                    if self.stage not in READY_STAGES:
+                        raise RobotError("Drill control requires an idle workflow.")
+                self.configure_drill(data or {})
+                return
             if action in ("virtual-z", "virtual-drill", "source"):
                 if not self.simulated:
                     raise RobotError("Virtual controls never command physical hardware.")
@@ -131,6 +151,7 @@ class Workflow:
                     raise RobotError("Camera is not ready.")
                 self.clear_plan()
                 self.virtual_z, self.virtual_drill = 0, False
+                self.stop_drill_keepalive()
                 self.cancelled.clear()
                 self.stage, self.message = "HOMING", ""
                 work = self.prepare if action == "start" else self.home_only
@@ -138,23 +159,30 @@ class Workflow:
                   and review_id == self.before["id"] and self.plan and self.enable_dry_run):
                 self.stage, self.message = "CHECKING", ""
                 self.virtual_z, self.virtual_drill = 0, False
+                self.stop_drill_keepalive()
                 work = self.execute
             elif action == "reset" and (self.stage in ("FAULT", "ESTOP") or
                     self.stage in ("IDLE", "DONE", "REVIEW") and self.status and
                     self.status["state"] in ("FAULT", "ESTOP", "HOLD")):
                 self.cancelled.clear()
+                self.stop_drill_keepalive()
                 self.stage, self.message = "RESETTING", ""
                 work = self.reset
-            elif action in ("jog", "nudge", "save-park", "return-park", "record-pose") and self.stage in READY_STAGES:
+            elif action in ("jog", "z-jog", "nudge", "save-park", "return-park",
+                            "record-pose") and self.stage in READY_STAGES:
                 if action != "record-pose" and not self.enable_manual:
                     raise RobotError("Hardware manual controls are not enabled.")
                 data = data if data is not None else {}
-                if action in ("jog", "nudge"):
-                    axis, delta = data.get("axis"), data.get("delta")
-                    allowed = (10,) if action == "nudge" else JOG_STEPS
-                    if axis not in JOINTS or type(delta) is not int or abs(delta) not in allowed:
-                        raise RobotError("Select J1 or J2 and an allowed jog increment.")
-                status = self.manual_status(data, prehome=action == "nudge")
+                axis, delta = data.get("axis"), data.get("delta")
+                if action in ("jog", "z-jog", "nudge"):
+                    if action == "z-jog":
+                        if axis != "z" or type(delta) is not int or abs(delta) not in JOG_STEPS:
+                            raise RobotError("Select Z and an allowed jog increment.")
+                    else:
+                        allowed = (10,) if action == "nudge" else JOG_STEPS
+                        if axis not in JOINTS or type(delta) is not int or abs(delta) not in allowed:
+                            raise RobotError("Select J1 or J2 and an allowed jog increment.")
+                status = self.manual_status(data, prehome=action == "nudge", axis=axis)
                 if action == "record-pose":
                     if self.pose_log is None:
                         raise RobotError("Pose logging is not configured.")
@@ -175,6 +203,8 @@ class Workflow:
                     targets = None
                 elif action == "jog":
                     targets = {axis: status["pos"][axis] + delta}
+                elif action == "z-jog":
+                    targets = {"z": status["pos"]["z"] + delta}
                 elif action == "return-park":
                     if self.park is None:
                         raise RobotError("No camera-clear park pose is configured.")
@@ -199,6 +229,53 @@ class Workflow:
                 raise RobotError("Action unavailable in this state or review no longer current.")
             self.worker = threading.Thread(target=self.run, args=(work,), daemon=True)
             self.worker.start()
+
+    def stop_drill_keepalive(self):
+        self.drill_stop.set()
+        self.drill_on = False
+
+    def configure_drill(self, data):
+        on = data.get("on")
+        if type(on) is not bool:
+            raise RobotError("Select a drill state.")
+        status = self.client.status()
+        if status["simulator"] != self.simulated:
+            raise RobotError("Controller mode mismatch.")
+        if on:
+            if (data.get("boot") != status["boot"] or type(data.get("command_id")) is not int or
+                    data["command_id"] != status["command_id"]):
+                raise RobotError("The displayed pose is stale. Wait for the live readout and try again.")
+            if status["state"] != "IDLE":
+                raise RobotError("The controller must be idle to turn the drill on.")
+        self.client.request("drill", {"on": on, "boot": status["boot"]})
+        try:
+            self.status = self.client.status()
+        except RobotError:
+            pass
+        if on:
+            self.drill_on = True
+            if not (self.drill_keepalive and self.drill_keepalive.is_alive()):
+                self.drill_stop.clear()
+                self.drill_keepalive = threading.Thread(target=self.keep_drill_alive, daemon=True)
+                self.drill_keepalive.start()
+            self.message = ("Drill on. It stops on Stop, fault, link loss, or heartbeat expiry."
+                            if not self.simulated else "Virtual drill on.")
+        else:
+            self.stop_drill_keepalive()
+            self.message = "Drill off."
+
+    def keep_drill_alive(self):
+        while not self.drill_stop.wait(0.5):
+            try:
+                status = self.client.status()
+                if not status.get("spindle"):
+                    break
+                self.client.request("heartbeat", {"boot": status["boot"],
+                                                   "command_id": status["command_id"]})
+            except RobotError:
+                break
+        with self.condition:
+            self.drill_on = False
 
     def configure_simulation(self, action, data):
         if action == "source":
@@ -230,6 +307,11 @@ class Workflow:
     def run(self, action):
         try:
             action()
+        except MotionStopped as exc:
+            with self.condition:
+                if self.cancelled.is_set():
+                    return
+                self.stage, self.message = "IDLE", str(exc)
         except Exception as exc:
             # Unexpected errors must fail closed too; the MCU owns the lease.
             with self.condition:
@@ -245,6 +327,7 @@ class Workflow:
         self.cancelled.set()
         with self.condition:
             self.virtual_z, self.virtual_drill = 0, False
+            self.stop_drill_keepalive()
             try:
                 self.client.request("estop", {})
                 self.stage, self.message = "ESTOP", "Network stop latched. Reset and re-home before resuming."
@@ -257,15 +340,11 @@ class Workflow:
             self.client.request("reset", {})
         self.clear_plan()
         self.virtual_z, self.virtual_drill = 0, False
+        self.stop_drill_keepalive()
         self.transition("IDLE", "Reset complete. Next Start will re-home.")
 
     def move(self, status, targets, feed=2000):
-        if status["pos"]["z"] != 0:
-            raise RobotError("The controller is not reporting the fixed-Z placeholder.")
-        for axis in JOINTS:
-            if axis not in targets:
-                continue
-            target = targets[axis]
+        for axis, target in targets.items():
             if status["pos"][axis] != target:
                 status = self.client.motion("move", {"axis": axis, "to": target, "feed": feed},
                                             self.cancelled, expected_boot=self.boot,
@@ -370,10 +449,13 @@ class Workflow:
             raise RobotError("The visible targets changed or registration failed.")
 
     def execute(self):
+        status = self.client.status()
+        if status.get("spindle"):
+            self.client.request("drill", {"on": False, "boot": status["boot"]})
         self.compare_scans(self.session.measure())
         status = self.client.status()
         if (status["boot"] != self.boot or status["state"] != "IDLE" or not status["homed"]
-                or status["pos"] != {"z": 0, **self.park}):
+                or any(status["pos"][axis] != self.park[axis] for axis in JOINTS)):
             raise RobotError("Controller is not homed at the approved park pose.")
         self.transition("EXECUTING")
         for point in self.plan:

@@ -34,10 +34,11 @@ constexpr int32_t NUDGE_STEPS = 10, NUDGE_BUDGET = 30;
 enum State { IDLE, HOMING, MOVING, HOLD, FAULT, ESTOP };
 enum HomePhase { SEEK, RELEASE, LATCH, BACKOFF };
 constexpr uint32_t LEASE_MS = 2000;
+constexpr uint32_t DRILL_LEASE_MS = 2500;  // heartbeat must renew while the drill is on
 constexpr uint32_t HOME_FEED_US = 5000, LATCH_FEED_US = 9000;
 constexpr uint32_t MIN_FEED_US = 1000, MAX_FEED_US = 20000;
 constexpr uint32_t DEBOUNCE_MS = 8;
-constexpr uint8_t SPINDLE_PIN = 23;     // active HIGH; always LOW in this build.
+constexpr uint8_t SPINDLE_PIN = 23;     // active HIGH; off on boot, stop, fault and link loss
 constexpr int Z = 0;
 constexpr int J1 = 1, J2 = 2;
 
@@ -60,6 +61,8 @@ char bootId[17];
 bool motionTaskReady = false;
 bool profileValid = false;
 bool serving = false;
+bool drillOn = false;
+uint32_t drillLease = 0;
 wl_status_t lastNetStatus = WL_IDLE_STATUS;
 IPAddress lastIp;
 uint32_t lastLinkReport = 0, lastStatusChange = 0;
@@ -109,7 +112,12 @@ const char* netName(wl_status_t status) {
 
 bool validProfile() {
   const Axis& z = AXES[Z];
-  if (!MOTION_COMMISSIONED || z.homeSign != 0 || z.minSteps != 0 || z.maxSteps != 0 ||
+  // Z has no homing phase and no upper switch. It is an unreferenced, bounded
+  // step axis; pos.z = 0 is the boot datum, not a measured height.
+  if (!MOTION_COMMISSIONED ||
+      z.homeSign < -1 || z.homeSign > 1 || z.positiveLevel > HIGH ||
+      z.minSteps >= z.maxSteps || z.minSteps > 0 || z.maxSteps < 0 ||
+      z.minSteps < -1000000 || z.maxSteps > 1000000 ||
       z.seekSteps != 0 || z.releaseSteps != 0 || z.backoffSteps != 0) return false;
   for (int i = J1; i <= J2; ++i) {
     const Axis& axis = AXES[i];
@@ -134,6 +142,8 @@ void halt(State state, const char* fault) {
     motion.target[i] = motion.pos[i];
   }
   digitalWrite(SPINDLE_PIN, LOW);
+  drillOn = false;
+  drillLease = 0;
   motion.state = state;
   motion.fault = fault;
   motion.homed = false;
@@ -185,12 +195,29 @@ void tick(bool connected) {
     halt(FAULT, "HEARTBEAT");  // No uncommanded retraction in this spindle-off release.
     return;
   }
-  // The bottom contact is a veto, not a sensor for raised-tool clearance.
-  if (triggered(Z)) {
+  // The bottom contact stops downward Z only. Upward Z may leave a pressed
+  // switch so the tool can be raised; there is no upper switch.
+  if (motion.state == HOMING) {
+    if (triggered(Z)) {
+      halt(FAULT, "Z_BOTTOM_LIMIT");
+      return;
+    }
+  } else if (motion.axis == Z) {
+    if (triggered(Z) && motion.sign < 0) {
+      // The bottom contact ends a downward Z move without invalidating the
+      // rotary datum. The operator can then jog Z+ to lift off the switch.
+      digitalWrite(AXES[Z].stepPin, LOW);
+      motion.pulse = false;
+      motion.target[Z] = motion.pos[Z];
+      motion.state = IDLE;
+      motion.fault = "Z_BOTTOM_LIMIT";
+      return;
+    }
+  } else if (triggered(Z)) {
     halt(FAULT, "Z_BOTTOM_LIMIT");
     return;
   }
-  if (motion.state == MOVING) {
+  if (motion.state == MOVING && motion.axis != Z) {
     for (int i = J1; i <= J2; ++i) {
       if (triggered(i)) {
         halt(FAULT, i == J1 ? "LIMIT_J1" : "LIMIT_J2");
@@ -203,7 +230,7 @@ void tick(bool connected) {
   }
 
   int i = motion.axis;
-  if (i != J1 && i != J2) {
+  if (i != Z && i != J1 && i != J2) {
     halt(FAULT, "INVALID_MOTION_AXIS");
     return;
   }
@@ -257,10 +284,20 @@ void tick(bool connected) {
   motion.nextEdge = edge + motion.feed;
 }
 
+void tickDrill(bool connected) {
+  if (!drillOn) return;
+  if (!connected || static_cast<int32_t>(millis() - drillLease) >= 0) {
+    digitalWrite(SPINDLE_PIN, LOW);
+    drillOn = false;
+    drillLease = 0;
+  }
+}
+
 void motorTask(void*) {
   for (;;) {
     bool connected = WiFi.status() == WL_CONNECTED;
     portENTER_CRITICAL(&motionLock);
+    tickDrill(connected);
     tick(connected);
     portEXIT_CRITICAL(&motionLock);
     vTaskDelay(1);
@@ -290,6 +327,7 @@ void status() {
   if (!authorized()) return;
   portENTER_CRITICAL(&motionLock);
   Motion current = motion;
+  const bool currentDrill = drillOn;
   portEXIT_CRITICAL(&motionLock);
   JsonDocument doc;
   doc["fw"] = "scara-slave/1.0";
@@ -297,9 +335,10 @@ void status() {
   doc["command_id"] = current.command;
   doc["state"] = stateName(current.state);
   doc["homed"] = current.homed;
-  doc["spindle"] = false;
+  doc["spindle"] = currentDrill;
   doc["spindle_gpio"] = SPINDLE_PIN;
-  doc["z_mode"] = "fixed";
+  doc["drill_lease_ms"] = DRILL_LEASE_MS;
+  doc["z_mode"] = "bounded";
   doc["commissioned"] = profileValid && motionTaskReady;
   doc["prehome_nudge"]["enabled"] = bool(SCARA_ENABLE_PREHOME_NUDGE) && profileValid && motionTaskReady;
   doc["prehome_nudge"]["step"] = NUDGE_STEPS;
@@ -346,7 +385,7 @@ void command() {
   const bool validNudge = (axis == J1 || axis == J2) && input["delta"].is<int32_t>() &&
       (delta == NUDGE_STEPS || delta == -NUDGE_STEPS) &&
       input["clearance_confirmed"].is<bool>() && input["clearance_confirmed"].as<bool>();
-  const bool validMove = (axis == J1 || axis == J2) && input["to"].is<int32_t>() &&
+  const bool validMove = (axis == Z || axis == J1 || axis == J2) && input["to"].is<int32_t>() &&
       input["feed"].is<uint32_t>() && feed >= MIN_FEED_US && feed <= MAX_FEED_US &&
       target >= AXES[axis].minSteps && target <= AXES[axis].maxSteps;
   const bool matchingBoot = strcmp(input["boot"] | "", bootId) == 0;
@@ -367,28 +406,53 @@ void command() {
     else if (active() && static_cast<int32_t>(millis() - motion.lease) >= 0) {
       halt(FAULT, "HEARTBEAT");
       error = "HEARTBEAT_EXPIRED";
-    } else if (active()) motion.lease = millis() + LEASE_MS;
+    } else {
+      if (active()) motion.lease = millis() + LEASE_MS;
+      if (drillOn) drillLease = millis() + DRILL_LEASE_MS;
+    }
+  } else if (path == "/drill" && input["on"].is<bool>()) {
+    if (!input["on"].as<bool>()) {
+      digitalWrite(SPINDLE_PIN, LOW);
+      drillOn = false;
+      drillLease = 0;
+    } else if (!matchingBoot) error = "COMMAND_CHANGED";
+    else if (motion.state != IDLE) error = "INVALID_STATE_OR_COMMAND";
+    else {
+      digitalWrite(SPINDLE_PIN, HIGH);
+      drillOn = true;
+      drillLease = millis() + DRILL_LEASE_MS;
+    }
   } else if (path == "/spindle" && input["on"].is<bool>()) {
     digitalWrite(SPINDLE_PIN, LOW);
     if (input["on"].as<bool>()) error = "SPINDLE_DISABLED";
   } else if ((path == "/home" || path == "/move" || nudge) && motion.state == IDLE) {
     if (!profileValid || !motionTaskReady) error = "NOT_COMMISSIONED";
     else if (!validHeartbeat || !matchingBoot || motion.command != expected) error = "COMMAND_CHANGED";
-    else if ((path == "/move" || nudge) && axis == Z) { error = "Z_FIXED"; code = 400; }
-    else if (triggered(Z)) error = "Z_BOTTOM_LIMIT";
     else if (path == "/home") {
-      motion.state = HOMING;
-      motion.homed = false;
-      startHomeAxis(J1);
-      code = 202;
+      if (triggered(Z)) error = "Z_BOTTOM_LIMIT";
+      else {
+        digitalWrite(SPINDLE_PIN, LOW);
+        drillOn = false;
+        drillLease = 0;
+        motion.fault = nullptr;
+        motion.state = HOMING;
+        motion.homed = false;
+        startHomeAxis(J1);
+        code = 202;
+      }
     } else if (nudge) {
-      if (!SCARA_ENABLE_PREHOME_NUDGE) error = "PREHOME_NUDGE_DISABLED";
+      if (triggered(Z)) error = "Z_BOTTOM_LIMIT";
+      else if (!SCARA_ENABLE_PREHOME_NUDGE) error = "PREHOME_NUDGE_DISABLED";
       else if (!validNudge) { error = "INVALID_NUDGE_OR_CLEARANCE"; code = 400; }
       else if (motion.homed) error = "ALREADY_HOMED";
       else if (motion.nudgeSpent + NUDGE_STEPS > NUDGE_BUDGET) error = "NUDGE_BUDGET_EXHAUSTED";
       else if (triggered(J1) || triggered(J2)) error = "JOINT_LIMIT_ACTIVE";
       else {
         motion.nudgeSpent += NUDGE_STEPS;
+        digitalWrite(SPINDLE_PIN, LOW);
+        drillOn = false;
+        drillLease = 0;
+        motion.fault = nullptr;
         motion.axis = axis;
         motion.target[axis] = motion.pos[axis] + delta;
         motion.state = MOVING;
@@ -396,9 +460,27 @@ void command() {
         code = 202;
       }
     } else if (!validMove) { error = "INVALID_TARGET_OR_FEED"; code = 400; }
-    else if (!motion.homed) error = "NOT_HOMED";
+    else if (axis != Z && !motion.homed) error = "NOT_HOMED";
+    else if (axis == Z) {
+      if (triggered(Z) && target < motion.pos[Z]) error = "Z_BOTTOM_LIMIT";
+      else {
+        digitalWrite(SPINDLE_PIN, LOW);
+        drillOn = false;
+        drillLease = 0;
+        motion.fault = nullptr;
+        motion.axis = axis;
+        motion.target[axis] = target;
+        motion.state = MOVING;
+        direction(target >= motion.pos[axis] ? 1 : -1, feed);
+        code = 202;
+      }
+    } else if (triggered(Z)) error = "Z_BOTTOM_LIMIT";
     else if (triggered(J1) || triggered(J2)) error = "JOINT_LIMIT_ACTIVE";
     else {
+      digitalWrite(SPINDLE_PIN, LOW);
+      drillOn = false;
+      drillLease = 0;
+      motion.fault = nullptr;
       motion.axis = axis;
       motion.target[axis] = target;
       motion.state = MOVING;
@@ -435,7 +517,7 @@ void setup() {
            static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
   profileValid = validProfile();
   motionTaskReady = xTaskCreate(motorTask, "scara_motion", 4096, nullptr, 2, nullptr) == pdPASS;
-  Serial.printf("\nSCARA %s (" __DATE__ " " __TIME__ ") / fixed Z\n",
+  Serial.printf("\nSCARA %s (" __DATE__ " " __TIME__ ") / bounded unreferenced Z\n",
                 profileValid && motionTaskReady ? "DRY-RUN" : "STATUS-ONLY");
   Serial.printf("Profile: commission=%d z[%ld,%ld] j1[%ld,%ld] j2[%ld,%ld]\n",
                 profileValid ? 1 : 0,
@@ -451,7 +533,8 @@ void setup() {
   static const char* headers[] = {"X-SCARA-Token"};
   server.collectHeaders(headers, 1);
   server.on("/status", HTTP_GET, status);
-  const char* commands[] = {"/home", "/move", "/nudge", "/heartbeat", "/stop", "/estop", "/reset", "/spindle"};
+  const char* commands[] = {"/home", "/move", "/nudge", "/heartbeat", "/stop", "/estop", "/reset",
+                            "/spindle", "/drill"};
   for (const char* path : commands) server.on(path, HTTP_POST, command);
   server.onNotFound([]() { failure(404, "UNKNOWN_ENDPOINT"); });
   WiFi.mode(WIFI_STA);

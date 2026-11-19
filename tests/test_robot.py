@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
-from robot.client import RobotClient, RobotError
+from robot.client import MotionStopped, RobotClient, RobotError
 from robot.planner import Planner
 from robot.sim import Controller, server
 from robot.workflow import Workflow
@@ -36,15 +36,64 @@ class RobotTest(unittest.TestCase):
             self.assertEqual(finish["pos"]["j1"], 100)
             with self.assertRaisesRegex(RobotError, "SPINDLE_DISABLED"):
                 client.request("spindle", {"on": True})
-            for to in (-1, 0):
-                with self.assertRaisesRegex(RobotError, "Z_FIXED"):
-                    client.motion("move", {"axis": "z", "to": to, "feed": 2000}, Event())
+            status = client.status()
+            client.request("drill", {"on": True, "boot": status["boot"]})
+            self.assertTrue(client.status()["spindle"])
+            client.request("heartbeat", {"boot": status["boot"],
+                                         "command_id": client.status()["command_id"]})
+            client.request("drill", {"on": False, "boot": status["boot"]})
+            self.assertFalse(client.status()["spindle"])
+            for to in (100, -100):
+                finish = client.motion("move", {"axis": "z", "to": to, "feed": 2000}, Event())
+                self.assertEqual(finish["pos"]["z"], to)
             client.request("estop", {})
             self.assertEqual(client.status()["state"], "ESTOP")
             with self.assertRaises(RobotError):
                 client.request("home", {})
             client.request("reset", {})
             self.assertFalse(client.status()["homed"])
+
+    def test_z_and_drill_work_without_homing(self):
+        with server(controller=Controller(move_seconds=.02)) as (url, token):
+            client = RobotClient(url, token)
+            status = client.status()
+            client.request("drill", {"on": True, "boot": status["boot"]})
+            self.assertTrue(client.status()["spindle"])
+            finish = client.motion("move", {"axis": "z", "to": 50, "feed": 2000}, Event())
+            self.assertEqual(finish["pos"]["z"], 50)
+            self.assertFalse(finish["homed"])
+            self.assertFalse(finish["spindle"])
+            with self.assertRaisesRegex(RobotError, "NOT_HOMED"):
+                client.motion("move", {"axis": "j1", "to": 10, "feed": 2000}, Event())
+            status = client.status()
+            client.request("drill", {"on": True, "boot": status["boot"]})
+            client.request("stop", {})
+            self.assertFalse(client.status()["spindle"])
+
+    def test_drill_lease_expires_without_heartbeat(self):
+        with server(controller=Controller(move_seconds=.02, drill_seconds=.15)) as (url, token):
+            client = RobotClient(url, token)
+            status = client.status()
+            client.request("drill", {"on": True, "boot": status["boot"]})
+            self.assertTrue(client.status()["spindle"])
+            time.sleep(.3)
+            self.assertFalse(client.status()["spindle"])
+
+    def test_z_bottom_switch_stops_without_losing_home(self):
+        controller = Controller(move_seconds=.02)
+        with server(controller=controller) as (url, token):
+            client = RobotClient(url, token)
+            client.motion("home", {}, Event())
+            client.motion("move", {"axis": "z", "to": 50, "feed": 2000}, Event())
+            controller.z_bottom = True
+            with self.assertRaisesRegex(MotionStopped, "bottom switch"):
+                client.motion("move", {"axis": "z", "to": 0, "feed": 2000}, Event())
+            status = client.status()
+            self.assertEqual((status["state"], status["homed"], status["fault"]),
+                             ("IDLE", True, "Z_BOTTOM_LIMIT"))
+            controller.z_bottom = False
+            status = client.motion("move", {"axis": "z", "to": 60, "feed": 2000}, Event())
+            self.assertEqual((status["pos"]["z"], status["fault"]), (60, None))
 
     def test_status_cannot_keep_motion_lease_alive(self):
         with server(controller=Controller(move_seconds=1, lease_seconds=.06)) as (url, token):
@@ -129,7 +178,7 @@ class RobotTest(unittest.TestCase):
             def jog(axis, delta, status=None):
                 workflow.launch("jog", data=dict(status or client.status(), axis=axis, delta=delta))
 
-            with self.assertRaisesRegex(RobotError, "idle and homed"):
+            with self.assertRaisesRegex(RobotError, "Home J1/J2"):
                 jog("j1", 10)
             workflow.launch("home")
             workflow.worker.join(5)
@@ -206,7 +255,7 @@ class RobotTest(unittest.TestCase):
             for action in ("start", "execute"):
                 with self.assertRaisesRegex(RobotError, "manual-only"):
                     workflow.launch(action)
-            with self.assertRaisesRegex(RobotError, "idle and homed"):
+            with self.assertRaisesRegex(RobotError, "Home J1/J2"):
                 workflow.launch("jog", data={"axis": "j2", "delta": 10})
             workflow.launch("home")
             workflow.worker.join(5)
@@ -214,6 +263,37 @@ class RobotTest(unittest.TestCase):
             workflow.worker.join(5)
             self.assertEqual(client.status()["pos"]["j2"], 10)
             self.assertFalse(workflow.describe()["can_execute"])
+
+    def test_manual_z_and_drill_work_before_homing(self):
+        with server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True, manual_only=True)
+            workflow.launch("z-jog", data=dict(client.status(), axis="z", delta=10))
+            workflow.worker.join(5)
+            self.assertEqual(client.status()["pos"]["z"], 10)
+            self.assertFalse(client.status()["homed"])
+            workflow.launch("drill", data=dict(client.status(), on=True))
+            self.assertTrue(client.status()["spindle"])
+            workflow.launch("drill", data=dict(client.status(), on=False))
+            self.assertFalse(client.status()["spindle"])
+            workflow.drill_keepalive.join(5)
+
+    def test_manual_z_bottom_stop_keeps_workflow_idle(self):
+        controller = Controller(move_seconds=.02)
+        with server(controller=controller) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True, manual_only=True)
+            client.motion("home", {}, Event())
+            client.motion("move", {"axis": "z", "to": 50, "feed": 2000}, Event())
+            controller.z_bottom = True
+            workflow.launch("z-jog", data=dict(client.status(), axis="z", delta=-10))
+            workflow.worker.join(5)
+            self.assertEqual(workflow.stage, "IDLE")
+            self.assertIn("bottom", workflow.message)
+            self.assertTrue(client.status()["homed"])
+            self.assertEqual(client.status()["pos"]["z"], 50)
 
     def test_prehome_nudges_are_limited_and_do_not_establish_home(self):
         with server(controller=Controller(move_seconds=.02)) as (url, token):
@@ -293,6 +373,14 @@ class RobotTest(unittest.TestCase):
                     with urlopen(base + "robot/poses.csv", timeout=3) as response:
                         row = next(csv.DictReader(response.read().decode().splitlines()))
                     self.assertEqual((row["label"], row["j2_steps"]), ("Sample", "10"))
+                    post("z-jog", dict(status(), axis="z", delta=10))
+                    session.workflow.worker.join(5)
+                    self.assertEqual(status()["pos"]["z"], 10)
+                    post("drill", dict(status(), on=True))
+                    self.assertTrue(status()["spindle"])
+                    post("drill", dict(status(), on=False))
+                    self.assertFalse(status()["spindle"])
+                    session.workflow.drill_keepalive.join(5)
                 finally:
                     app.shutdown()
                     thread.join()

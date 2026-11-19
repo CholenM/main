@@ -1,7 +1,8 @@
 # SCARA command guide
 
 Run Jetson commands in `~/main`. The dashboard binds to loopback; do not expose
-it directly to the network. The spindle remains off and Z is fixed.
+it directly to the network. The vision workflow remains a dry run. Manual control
+can jog a bounded, unreferenced Z axis and toggle the drill relay.
 
 ## 1. Open the dashboard
 
@@ -22,10 +23,12 @@ Open `http://localhost:8080/`. Use **Connect ESP32**, then enter its private
 IPv4 address and the token from `secrets.h`. The token stays in the dashboard
 process for this session. Connecting reads status without moving the arm.
 
-- **Manual control** (`/manual`): live camera, J1/J2 controls, Home, Reset,
-  Network stop, homing traces, and pose recording. No tags, calibration, or park
-  pose required. This build locks physical Z and holds the drill relay on
-  GPIO 23 off. Virtual Z/drill controls are available on the simulator only.
+- **Manual control** (`/manual`): live camera, J1/J2 controls, Z −/Z +, drill
+  toggle, Home, Reset, Network stop, homing traces, and pose recording. No tags,
+  calibration, or park pose required. Z is an unreferenced, bounded step axis:
+  `0` is the boot datum, there is no upper switch, and downward motion stops on
+  the bottom switch. The drill relay is GPIO 23. It has no interlock and drops on
+  Stop, Reset, fault, link loss, heartbeat expiry, or a new motion command.
 - **Vision workflow** (`/`): with a verified park pose, Start homes, parks,
   and scans. The default launch does not allow physical target execution.
 - **Run simulation** (`/sim/`): choose **Built-in fixture** or **Live camera**.
@@ -45,9 +48,10 @@ They are disabled in the supplied firmware profile.
 
 Before enabling this test, an on-site operator must verify that the hardwired
 E-stop removes drive power, remove the drill bit, physically disconnect the
-spindle, and mechanically secure Z. With drive power isolated, verify switch
-wiring and mark a known test pose that has clearance in **both** directions on
-both joints for the full pulse budget, including clearance from cables and the
+spindle, and keep Z clear of the fixture and cables. Pre-home nudges move J1/J2
+only; a pressed Z bottom switch blocks them. With drive power isolated, verify
+switch wiring and mark a known test pose that has clearance in **both** directions
+on both joints for the full pulse budget, including clearance from cables and the
 fixture. Do not power-test a joint that is still binding or stalling.
 
 On the flashing workstation, once those checks pass and the measured machine
@@ -105,15 +109,16 @@ the active command's heartbeat and checks completion.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /status` | State, commanded joint counts, switches, and pre-home budget |
+| `GET /status` | State, commanded joint/Z counts, drill relay, switches, and pre-home budget |
 | `POST /home` | Home J1 then J2 |
-| `POST /move` | Bounded absolute J1/J2 move after home |
-| `POST /nudge` | One commissioned pre-home nudge |
-| `POST /heartbeat` | Renew the matching active command's lease |
-| `POST /stop` | Stop motion and latch HOLD |
+| `POST /move` | Bounded absolute J1/J2 move after home; bounded Z without homing |
+| `POST /nudge` | One commissioned pre-home J1/J2 nudge |
+| `POST /heartbeat` | Renew the matching motion lease and any active drill lease |
+| `POST /drill` | Toggle the drill relay; `true` needs the current boot and an idle controller |
+| `POST /stop` | Stop motion, drop the drill and latch HOLD |
 | `POST /estop` | Latch network stop; not a substitute for the hardwired stop |
-| `POST /reset` | Clear a stopped/faulted controller; leaves it unhomed |
-| `POST /spindle` | Off only; enabling is rejected |
+| `POST /reset` | Clear a stopped/faulted controller; drops the drill and leaves it unhomed |
+| `POST /spindle` | Legacy endpoint; off only, enabling is rejected |
 
 See the [controller contract](robot-contract.md) for request formats and
 commissioning details.

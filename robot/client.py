@@ -14,6 +14,10 @@ class RobotError(Exception):
     pass
 
 
+class MotionStopped(RobotError):
+    """A motion ended on a normal end-of-travel contact, not a latched fault."""
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -62,8 +66,8 @@ class RobotClient:
                 or any(type(status["pos"].get(axis)) is not int for axis in AXES)
                 or status.get("state") not in ("IDLE", "HOMING", "MOVING", "RECOVERING",
                                                "HOLD", "FAULT", "ESTOP")
-                or status.get("spindle") is not False):
-            raise RobotError("Unsupported firmware/status or spindle not confirmed off.")
+                or type(status.get("spindle")) is not bool):
+            raise RobotError("Unsupported firmware/status response.")
         return status
 
     def motion(self, path, payload, cancelled, timeout=120, expected_boot=None,
@@ -99,9 +103,11 @@ class RobotClient:
                     reached = (not status["homed"] and
                                status["pos"][axis] == before["pos"][axis] + payload["delta"])
                 else:
-                    reached = status["homed"] and (path != "move" or
-                              status["pos"][payload["axis"]] == payload["to"])
+                    reached = (status["homed"] or payload.get("axis") == "z") and (
+                        path != "move" or status["pos"][payload["axis"]] == payload["to"])
                 if not reached:
+                    if status.get("fault") == "Z_BOTTOM_LIMIT":
+                        raise MotionStopped("Z stopped at the bottom switch.")
                     raise RobotError("Controller did not reach the requested datum/target.")
                 return status
             if status["state"] not in ("HOMING", "MOVING"):
