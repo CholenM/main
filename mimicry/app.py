@@ -115,7 +115,9 @@ class Dashboard(BaseHTTPRequestHandler):
             data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError("Expected a JSON object.")
-            if self.path == "/api/observe":
+            if self.path == "/api/presence" and self.tracking is not None:
+                self.control.presence(owner, data.get("frame"))
+            elif self.path == "/api/observe" and self.tracking is None:
                 self.control.observe(owner, data)
             elif self.path.startswith("/api/") and self.path[5:] in ACTIONS:
                 self.control.action(owner, self.path[5:])
@@ -157,11 +159,6 @@ def main():
         signal.signal(signal.SIGTERM, interrupt)
         with ExitStack() as stack:
             stack.enter_context(exclusive(".viewer.lock", "Stop the drilling or Mimicry dashboard first."))
-            tracking = None
-            if not args.no_camera:
-                stack.enter_context(camera_lock())
-                camera = stack.enter_context(LiveCamera(args.camera, encode_preview=False))
-                tracking = stack.enter_context(Tracking(camera))
             if args.robot_url:
                 url, token = args.robot_url, os.environ.get("SCARA_ROBOT_TOKEN", "")
                 if not token:
@@ -169,7 +166,13 @@ def main():
             else:
                 url, token = stack.enter_context(sim.server(controller=sim.Controller(
                     mimic_z_max=Z_CAP, move_seconds=0.07)))
-            control = Control(RobotClient(url, token), not args.robot_url, args.reverse_j1)
+            control = Control(RobotClient(url, token), not args.robot_url, args.reverse_j1,
+                              live=not args.no_camera)
+            tracking = None
+            if not args.no_camera:
+                stack.enter_context(camera_lock())
+                camera = stack.enter_context(LiveCamera(args.camera, encode_preview=False))
+                tracking = stack.enter_context(Tracking(camera, on_observation=control.observe_live))
             handler = partial(Dashboard, control=control, tracking=tracking, secret=secrets.token_hex(32))
             with ThreadingHTTPServer(("127.0.0.1", args.port), handler) as dashboard:
                 print(f"Mimicry: http://127.0.0.1:{dashboard.server_port}/ "
@@ -177,8 +180,7 @@ def main():
                 try:
                     dashboard.serve_forever()
                 finally:
-                    if control.home_busy():
-                        control.emergency_stop()
+                    control.close()
     except KeyboardInterrupt:
         return 0
     except ImportError as exc:

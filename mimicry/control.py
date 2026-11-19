@@ -5,10 +5,13 @@ import time
 from collections import OrderedDict
 from threading import Event, Lock, Thread
 
-from robot.client import RobotError
+from robot.client import RobotError, TransportUnavailable
 
 MAX_SAMPLE_AGE = 0.40
+BROWSER_WINDOW = 0.70
+PREVIEW_WINDOW = 1.0
 SETUP_WINDOW = 8.0
+RECENTER_WINDOW = 2.5
 DEADZONE = 0.09
 ENTER_ZONE = 0.12
 J1_CHUNK, Z_CHUNK, Z_CAP = 8, 30, 136062
@@ -37,20 +40,29 @@ def parse_palm(data):
 
 
 class Control:
-    def __init__(self, client, simulated, reverse_j1=False, clock=time.monotonic):
+    def __init__(self, client, simulated, reverse_j1=False, clock=time.monotonic, *, live=False):
         self.client, self.simulated, self.clock = client, simulated, clock
+        self.live = live
         self.j1_right = -1 if reverse_j1 else 1
         self.lock = Lock()
+        self.poll_lock = Lock()
+        self.cached_status = (None, None, -math.inf)
         self.frames = OrderedDict()
         self.virtual_sequence = 0
         self.owner = self.center = None
         self.sample_sequence, self.sample_at = -1, -math.inf
+        self.browser_at = self.preview_at = -math.inf
         self.armed = False
         self.expected = self.intent = None
         self.same_direction = 0
         self.pending = self.setup_palm = None
+        self.pause_at = None
+        self.neutral_samples = 0
+        self.arm_epoch = self.intent_epoch = 0
+        self.jog_thread = None
         self.message = "Show one open palm, then set the joystick center."
         self.home_thread = None
+        self.last_home = None
         self.home_cancel = Event()
         self.stopping = Event()
 
@@ -61,7 +73,7 @@ class Control:
                 result = (self.virtual_sequence, b"", self.clock(), None)
             else:
                 result = preview
-            if result is None or self.clock() - result[2] > MAX_SAMPLE_AGE:
+            if result is None or self.clock() - result[2] > (PREVIEW_WINDOW if self.live else MAX_SAMPLE_AGE):
                 return None
             self.frames[result[0]] = result[2], result[3]
             while len(self.frames) > 24:
@@ -70,6 +82,9 @@ class Control:
 
     def disarm(self, message):
         self.armed = False
+        self.arm_epoch += 1
+        self.pause_at = None
+        self.neutral_samples = 0
         self.pending = self.setup_palm = None
         self.intent, self.same_direction = None, 0
         self.expected = None
@@ -77,9 +92,44 @@ class Control:
 
     def expire(self):
         if self.armed and self.clock() - self.sample_at > MAX_SAMPLE_AGE:
-            self.disarm("Tracking timed out. Return to center and arm again.")
+            self.disarm("Camera tracking timed out — no fresh local frames. Arm again after it recovers.")
+        if self.armed and self.live and not self.browser_ready():
+            self.disarm("Browser or preview timed out. Keep the tab visible and arm again.")
         if self.pending and self.clock() - self.pending[1] >= SETUP_WINDOW:
             self.disarm("No steady open palm detected. Show your whole hand and try again.")
+        if self.pause_at is not None and self.clock() - self.pause_at >= RECENTER_WINDOW:
+            self.disarm("Palm did not return to center. Select Arm Gestures to resume.")
+
+    def browser_ready(self):
+        now = self.clock()
+        return now - self.browser_at <= BROWSER_WINDOW and now - self.preview_at <= PREVIEW_WINDOW
+
+    def claim(self, owner):
+        if owner == self.owner:
+            return
+        active = self.browser_ready() if self.live else self.clock() - self.sample_at <= MAX_SAMPLE_AGE
+        if self.armed or self.pending or active:
+            raise RobotError("Another dashboard tab is active.")
+        self.owner, self.center, self.sample_sequence = owner, None, -1
+        self.browser_at = self.preview_at = self.sample_at = -math.inf
+
+    def presence(self, owner, sequence):
+        if type(sequence) is not int:
+            raise ValueError("Missing preview sequence.")
+        with self.lock:
+            self.expire()
+            stamp, _ = self.frames.get(sequence, (-math.inf, None))
+            if self.clock() - stamp > PREVIEW_WINDOW:
+                return
+            self.claim(owner)
+            self.browser_at = self.clock()
+            self.preview_at = max(stamp, self.preview_at)
+
+    def observe_live(self, sequence, stamp, observation):
+        with self.lock:
+            self.expire()
+            if self.owner is not None and self.browser_ready():
+                self.apply_observation(sequence, stamp, observation)
 
     def setup_sample(self, point, stamp):
         action, requested_at, expected = self.pending
@@ -105,6 +155,9 @@ class Control:
     def home_busy(self):
         return self.home_thread is not None and self.home_thread.is_alive()
 
+    def jog_busy(self):
+        return self.jog_thread is not None and self.jog_thread.is_alive()
+
     @staticmethod
     def controller_id(status):
         return status["boot"], status["command_id"]
@@ -113,7 +166,11 @@ class Control:
         status = self.client.status()
         if status["simulator"] != self.simulated:
             raise RobotError("Controller does not match the dashboard mode.")
+        self.remember_status(status)
         return status
+
+    def remember_status(self, status):
+        self.cached_status = (status, None, time.monotonic())
 
     @staticmethod
     def require_ready(status, referenced=False):
@@ -140,50 +197,86 @@ class Control:
     def observe(self, owner, data):
         with self.lock:
             self.expire()
-            if owner != self.owner:
-                if self.armed or self.pending or self.clock() - self.sample_at <= MAX_SAMPLE_AGE:
-                    raise RobotError("Another dashboard tab is active.")
-                self.owner, self.center, self.sample_sequence = owner, None, -1
+            self.claim(owner)
             sequence = data.get("frame")
             if type(sequence) is not int:
                 raise ValueError("Missing frame sequence.")
             stamp, measurement = self.frames.get(sequence, (-math.inf, None))
-            if sequence <= self.sample_sequence or self.clock() - stamp > MAX_SAMPLE_AGE:
-                return
             observation = measurement if measurement is not None else data
-            point = parse_palm(observation)
-            self.sample_sequence, self.sample_at = sequence, stamp
-            if self.pending:
-                if not self.stopping.is_set():
-                    self.setup_sample(point, stamp)
+            self.apply_observation(sequence, stamp, observation)
+
+    def apply_observation(self, sequence, stamp, observation):
+        # Called with self.lock held. Motion still uses the original camera capture time.
+        if sequence <= self.sample_sequence or self.clock() - stamp > MAX_SAMPLE_AGE:
+            return
+        point = parse_palm(observation)
+        self.sample_sequence, self.sample_at = sequence, stamp
+        if self.pending:
+            if not self.stopping.is_set():
+                self.setup_sample(point, stamp)
+            return
+        if not self.armed:
+            return
+        if point is None:
+            if observation["hand"] == "fist" or observation.get("reason") == "multiple":
+                reason = "Fist detected" if observation["hand"] == "fist" else "Multiple hands detected"
+                self.disarm(f"{reason}. Arm again to resume.")
+            else:
+                if self.pause_at is None:
+                    self.pause_at = self.clock()
+                    self.intent_epoch += 1
+                self.neutral_samples = self.same_direction = 0
+                self.intent = None
+                self.message = "Palm tracking paused — return your open palm to center."
+            return
+        if self.pause_at is not None:
+            neutral = max(abs(a-b) for a, b in zip(point, self.center)) <= DEADZONE
+            self.neutral_samples = self.neutral_samples + 1 if neutral else 0
+            if self.neutral_samples >= 2:
+                self.pause_at = None
+                self.message = "Palm reacquired at center — ready to jog."
+            return
+        intent = direction(self.center, point, self.intent)
+        if intent != self.intent:
+            self.intent_epoch += 1
+        self.same_direction = self.same_direction + 1 if intent == self.intent else 1
+        self.intent = intent
+        if intent is None:
+            self.message = "Centered — no new motion."
+        elif self.same_direction >= 2 and not self.jog_busy() and not self.stopping.is_set():
+            self.jog_thread = Thread(target=self.jog, args=(intent, self.arm_epoch, self.intent_epoch),
+                                     daemon=True)
+            self.jog_thread.start()
+
+    def jog(self, intent, arm_epoch, intent_epoch):
+        try:
+            status = self.checked_status()
+            with self.lock:
+                self.expire()
+                if (not self.armed or self.pause_at is not None or self.stopping.is_set() or
+                        (arm_epoch, intent_epoch) != (self.arm_epoch, self.intent_epoch)):
+                    return
+                self.require_ready(status, referenced=True)
+                if self.expected != self.controller_id(status):
+                    raise RobotError("Controller command or boot changed; arm again.")
+                move = self.jog_target(intent, status)
+            if move is None or self.stopping.is_set():
                 return
-            if not self.armed:
-                return
-            if point is None:
-                self.disarm("Fist detected. Arm again to resume." if observation["hand"] == "fist" else
-                            "Open palm not tracked. Return to center and arm again.")
-                return
-            intent = direction(self.center, point, self.intent)
-            self.same_direction = self.same_direction + 1 if intent == self.intent else 1
-            self.intent = intent
-            if intent is None:
-                self.message = "Centered — no new motion."
-            elif self.same_direction >= 2:
-                try:
-                    self.jog(intent)
-                except (RobotError, KeyError, TypeError, ValueError) as exc:
+            axis, delta = move
+            command = self.command("mimic-jog", status, axis=axis, delta=delta)
+            with self.lock:
+                if self.armed and arm_epoch == self.arm_epoch:
+                    self.expected = command
+                    if intent_epoch == self.intent_epoch:
+                        self.message = f"Jogging {axis.upper()} {intent}."
+        except (RobotError, KeyError, TypeError, ValueError) as exc:
+            with self.lock:
+                if self.armed and arm_epoch == self.arm_epoch:
                     self.disarm(f"Jog stopped: {exc}")
 
-    def jog(self, intent):
-        status = self.checked_status()
-        self.require_ready(status, referenced=True)
-        if self.expected != self.controller_id(status):
-            raise RobotError("Controller command or boot changed; arm again.")
+    def jog_target(self, intent, status):
         if status["state"] == "MOVING":
             return  # No queue, no retries, and no heartbeat for a jog chunk.
-        if self.stopping.is_set() or self.clock() - self.sample_at > MAX_SAMPLE_AGE:
-            self.disarm("Tracking stopped or the frame arrived too late.")
-            return
         axis = "j1" if intent in ("left", "right") else "z"
         bottom = status["limits"]["z"] == 0
         if axis == "j1" and (not status["homed"] or bottom):
@@ -196,12 +289,13 @@ class Control:
                 else (1 if intent == "up" else -1) * Z_CHUNK)
         low, high = status["bounds"][axis]
         pos = status["pos"][axis]
+        if not low <= pos <= high:
+            raise RobotError(f"{axis.upper()} position is outside the reported travel bounds.")
         delta = max(low, min(high, pos + step)) - pos
         if not delta:
             self.message = f"{axis.upper()} travel limit reached."
             return
-        self.expected = self.command("mimic-jog", status, axis=axis, delta=delta)
-        self.message = f"Jogging {axis.upper()} {intent}."
+        return axis, delta
 
     def action(self, owner, action):
         if action == "estop":
@@ -213,17 +307,14 @@ class Control:
                 if self.owner == owner:
                     self.disarm("Disarmed.")
                 return
-            if self.stopping.is_set() or self.home_busy():
-                raise RobotError("Stop or homing is in progress.")
+            if self.stopping.is_set() or self.home_busy() or self.jog_busy():
+                raise RobotError("Wait for the current jog, stop, or homing action to finish.")
             if self.armed:
                 raise RobotError("Disarm before changing settings.")
             if self.pending:
                 raise RobotError("Palm setup is already waiting. Select Disarm to cancel.")
             if action in ("center", "arm"):
-                if owner != self.owner:
-                    if self.clock() - self.sample_at <= MAX_SAMPLE_AGE:
-                        raise RobotError("Another dashboard tab is active.")
-                    self.owner, self.center, self.sample_sequence = owner, None, -1
+                self.claim(owner)
                 if action == "center":
                     self.pending = ("center", self.clock(), None)
                     self.message = "Hold one open palm steady where you want the joystick center."
@@ -250,21 +341,37 @@ class Control:
                 if status["limits"]["z"] != 1:
                     raise RobotError("Lift Z clear of the bottom switch first.")
                 self.home_cancel.clear()
+                self.last_home = None
                 self.message = "Homing J1 and J2."
                 self.home_thread = Thread(target=self.home, args=(status,), daemon=True)
                 self.home_thread.start()
 
     def home(self, status):
+        latest = None
+
+        def observe(snapshot):
+            nonlocal latest
+            latest = snapshot
+            self.remember_status(snapshot)
+
         try:
             boot, command = self.controller_id(status)
             self.client.motion("home", {}, self.home_cancel,
-                               expected_boot=boot, expected_command=command)
+                               expected_boot=boot, expected_command=command,
+                               observe=observe, recover_home_link=True)
             message = "Rotary joints homed. Select Arm to use J1 and Z."
         except RobotError as exc:
             message = f"Homing stopped: {exc}"
+            if isinstance(exc, TransportUnavailable) and not self.home_cancel.is_set():
+                try:
+                    self.client.request("stop", {}, timeout=.35)
+                except RobotError:
+                    pass  # The existing firmware lease still applies.
         with self.lock:
             if not self.home_cancel.is_set():
                 self.message = message
+                self.last_home = {"message": message, "axis": (latest or {}).get("home_axis"),
+                                  "phase": (latest or {}).get("home_phase")}
 
     def emergency_stop(self):
         self.stopping.set()
@@ -282,16 +389,31 @@ class Control:
             self.stopping.clear()
 
     def describe(self, owner):
-        try:
-            status, error = self.checked_status(), None
-        except RobotError as exc:
-            status, error = None, str(exc)
+        # Motion already reads status. Avoid competing requests to the ESP32 during home/jog.
+        if (not self.home_busy() and not self.jog_busy() and
+                time.monotonic() - self.cached_status[2] > .65 and self.poll_lock.acquire(blocking=False)):
+            try:
+                self.checked_status()
+            except RobotError as exc:
+                self.cached_status = (None, str(exc), time.monotonic())
+            finally:
+                self.poll_lock.release()
         with self.lock:
-            if error and (self.armed or (self.pending and self.pending[0] == "arm")):
+            status, error, _ = self.cached_status
+            if error and not self.jog_busy() and (self.armed or (self.pending and self.pending[0] == "arm")):
                 self.disarm("Controller link lost. Arm again after reconnecting.")
             self.expire()
             return {"robot": status, "error": error, "armed": self.armed,
                     "owner": owner == self.owner, "homing": self.home_busy(),
                     "pending": self.pending[0] if self.pending else None,
+                    "paused": self.pause_at is not None, "last_home": self.last_home,
                     "center": self.center if owner == self.owner else None,
                     "intent": self.intent, "message": self.message}
+
+    def close(self):
+        self.stopping.set()
+        if self.home_busy():
+            self.emergency_stop()
+        else:
+            with self.lock:
+                self.disarm("Dashboard closed.")

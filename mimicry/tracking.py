@@ -36,7 +36,7 @@ def visibly_extended(landmarks):
 
 def classify(result):
     if len(result.hand_landmarks) != 1:
-        return LOST
+        return {"hand": "lost", "reason": "multiple"} if result.hand_landmarks else LOST
     gesture = result.gestures[0][0] if result.gestures and result.gestures[0] else None
     label = gesture.category_name if gesture else "None"
     confident = bool(gesture and gesture.score >= GESTURE_CONFIDENCE)
@@ -53,11 +53,12 @@ def classify(result):
 
 
 class Tracking:
-    def __init__(self, camera):
+    def __init__(self, camera, *, on_observation):
         import mediapipe as mp
         from mediapipe.tasks.python import BaseOptions, vision
 
         self.camera, self.mp = camera, mp
+        self.on_observation = on_observation
         self.changed, self.closed = Condition(), Event()
         self.frame, self.error = None, None
         self.finished = deque(maxlen=30)
@@ -65,8 +66,8 @@ class Tracking:
         self.recognizer = vision.GestureRecognizer.create_from_options(
             vision.GestureRecognizerOptions(
                 base_options=BaseOptions(model_asset_path=str(MODEL), delegate=BaseOptions.Delegate.CPU),
-                running_mode=vision.RunningMode.VIDEO, num_hands=2, min_hand_detection_confidence=.65,
-                min_hand_presence_confidence=.65, min_tracking_confidence=.65))
+                running_mode=vision.RunningMode.VIDEO, num_hands=2, min_hand_detection_confidence=.55,
+                min_hand_presence_confidence=.55, min_tracking_confidence=.65))
         self.thread = Thread(target=self.run, daemon=True)
 
     def __enter__(self):
@@ -114,10 +115,16 @@ class Tracking:
                 result = self.recognizer.recognize_for_video(
                     self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb), int(stamp * 1000))
                 elapsed = round((time.monotonic() - started) * 1000)
-                ok, jpeg = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                observation = classify(result)
+                self.on_observation(seq, stamp, observation)
+                # Keep the operator preview light on the Wi-Fi link without
+                # reducing the resolution used for recognition.
+                if width > 480:
+                    preview = cv2.resize(preview, (480, round(height * 480 / width)),
+                                         interpolation=cv2.INTER_AREA)
+                ok, jpeg = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 64])
                 if not ok:
                     continue
-                observation = classify(result)
                 with self.changed:
                     self.frame = seq, jpeg.tobytes(), stamp, observation
                     self.finished.append(time.monotonic())

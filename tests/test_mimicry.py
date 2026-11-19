@@ -1,11 +1,12 @@
 import unittest
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mimicry.control import Control, MAX_SAMPLE_AGE, SETUP_WINDOW
+from mimicry.control import BROWSER_WINDOW, MAX_SAMPLE_AGE, PREVIEW_WINDOW, Control, SETUP_WINDOW
 from mimicry.tracking import classify
 from robot import sim
-from robot.client import RobotClient, RobotError
+from robot.client import RobotClient, RobotError, TransportUnavailable
 
 
 class MimicryTest(unittest.TestCase):
@@ -18,9 +19,11 @@ class MimicryTest(unittest.TestCase):
         self.now = 1.0
         self.control = Control(self.client, True, clock=lambda: self.now)
 
-    def sample(self, point=None, hand="open", owner="first", start_frame=None):
+    def sample(self, point=None, hand="open", owner="first", start_frame=None, wait=True):
         frame = start_frame or self.control.frame(virtual=True)[0]
         self.control.observe(owner, {"frame": frame, "hand": hand, "point": point})
+        if wait and self.control.jog_thread:
+            self.control.jog_thread.join(1)
         return frame
 
     def action(self, name):
@@ -88,14 +91,79 @@ class MimicryTest(unittest.TestCase):
         self.assertFalse(self.control.armed)
         self.arm()
         self.sample(hand="lost")
-        self.assertFalse(self.control.armed)
-        self.arm()
+        self.assertIsNotNone(self.control.pause_at)
         stale_frame = self.control.frame(virtual=True)[0]
         self.now += MAX_SAMPLE_AGE + .01
         self.sample([.5, .25], start_frame=stale_frame)
         self.sample([.5, .25])
         self.assertFalse(self.control.armed)
         self.assertEqual(self.client.status()["pos"]["z"], 30)
+
+    def test_missing_palm_pauses_and_requires_neutral_before_more_motion(self):
+        self.action("zero")
+        self.arm()
+        self.sample(hand="lost")
+        for _ in range(3):
+            self.sample([.5, .25])
+        self.assertIsNotNone(self.control.pause_at)
+        self.assertEqual(self.client.status()["pos"]["z"], 0)
+        for _ in range(2):
+            self.sample([.5, .5])
+        self.assertIsNone(self.control.pause_at)
+        for _ in range(2):
+            self.sample([.5, .25])
+        self.assertEqual(self.client.status()["pos"]["z"], 30)
+        frame = self.control.frame((99, b"jpeg", self.now, {"hand": "lost", "reason": "multiple"}))[0]
+        self.sample(start_frame=frame)
+        self.assertFalse(self.control.armed)
+
+    def test_slow_jog_status_does_not_hold_up_neutral_or_launch_old_direction(self):
+        self.action("zero")
+        self.arm()
+        started, release = Event(), Event()
+        status = self.client.status
+
+        def slow_status():
+            started.set()
+            release.wait(1)
+            return status()
+
+        with patch.object(self.client, "status", side_effect=slow_status):
+            self.sample([.5, .25], wait=False)
+            self.sample([.5, .25], wait=False)
+            self.assertTrue(started.wait(1))
+            try:
+                self.sample([.5, .5], wait=False)
+                self.assertIsNone(self.control.intent)
+                self.assertTrue(self.control.jog_busy())
+            finally:
+                release.set()
+                self.control.jog_thread.join(1)
+        self.assertEqual(status()["pos"]["z"], 0)
+
+    def test_homing_retries_transport_reads_and_heartbeats_but_not_home(self):
+        self.action("zero")
+        self.send("mimic-jog", axis="z", delta=30)
+        self.controller.move_seconds = .6
+        request = self.client.request
+        remaining = {"heartbeat", "status"}
+        calls = []
+
+        def one_drop(path, payload=None, *, timeout=None):
+            calls.append(path)
+            if timeout is not None and path in remaining:
+                remaining.remove(path)
+                raise TransportUnavailable("temporary test loss")
+            return request(path, payload, timeout=timeout)
+
+        with patch.object(self.client, "request", side_effect=one_drop):
+            self.action("home")
+            self.control.home_thread.join(2)
+        self.assertFalse(remaining)
+        self.assertEqual(calls.count("home"), 1)
+        self.assertGreaterEqual(calls.count("heartbeat"), 2)
+        self.assertTrue(self.client.status()["homed"])
+        self.assertIn("homed", self.control.last_home["message"])
 
     def test_external_commands_and_other_tabs_cannot_continue_armed_motion(self):
         self.action("zero")
@@ -177,6 +245,47 @@ class MimicryTest(unittest.TestCase):
         self.sample([.5, .5])
         self.assertFalse(self.control.armed)
 
+    def arm_live(self):
+        self.control = Control(self.client, True, clock=lambda: self.now, live=True)
+        self.action("zero")
+        self.control.presence("first", self.control.frame((1, b"jpg", self.now, None))[0])
+        self.action("center")
+        for sequence in (2, 3):
+            self.control.observe_live(sequence, self.now, {"hand": "open", "point": [.5, .5]})
+        self.action("arm")
+        for sequence in (4, 5):
+            self.control.observe_live(sequence, self.now, {"hand": "open", "point": [.5, .5]})
+        self.assertTrue(self.control.armed)
+
+    def test_live_camera_drives_without_browser_round_trip_per_observation(self):
+        self.arm_live()
+        off_center = {"hand": "open", "point": [.5, .25]}
+        for sequence in (6, 7):
+            self.control.observe_live(sequence, self.now, off_center)
+        self.control.jog_thread.join(1)
+        self.assertEqual(self.client.status()["pos"]["z"], 30)
+        # Fresh camera frames do not keep an absent browser armed.
+        for sequence in (8, 9):
+            self.now += BROWSER_WINDOW / 2 + .01
+            self.control.observe_live(sequence, self.now, {"hand": "open", "point": [.5, .5]})
+        self.assertFalse(self.control.armed)
+        self.assertIn("Browser or preview", self.control.message)
+
+    def test_live_browser_cannot_keep_stale_camera_or_frozen_preview_armed(self):
+        self.arm_live()
+        self.now += MAX_SAMPLE_AGE + .01
+        self.control.presence("first", 1)
+        self.assertFalse(self.control.armed)
+        self.assertIn("no fresh local frames", self.control.message)
+        self.arm_live()
+        # Browser can send presence for the same image temporarily, but not indefinitely.
+        for sequence in (6, 7, 8, 9):
+            self.now += PREVIEW_WINDOW / 4 + .01
+            self.control.presence("first", 1)
+            self.control.observe_live(sequence, self.now, {"hand": "open", "point": [.5, .5]})
+        self.assertFalse(self.control.armed)
+        self.assertIn("Browser or preview", self.control.message)
+
 
 class TrackingTest(unittest.TestCase):
     def test_only_one_confident_open_palm_provides_a_point(self):
@@ -188,7 +297,7 @@ class TrackingTest(unittest.TestCase):
         self.assertAlmostEqual(sample["point"][0], (0 + 5 + 9 + 13 + 17) / 100)
         self.assertEqual(sample["point"][1], .25)
         result.hand_landmarks.append(hand)
-        self.assertEqual(classify(result), {"hand": "lost"})
+        self.assertEqual(classify(result), {"hand": "lost", "reason": "multiple"})
         result.hand_landmarks.pop()
         category.score = .5
         self.assertEqual(classify(result), {"hand": "lost"})

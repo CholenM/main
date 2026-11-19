@@ -20,7 +20,7 @@ class ScanError(Exception):
     pass
 
 
-def open_camera(camera, *, size=(1920, 1080), fps=None):
+def open_camera(camera, *, size=(1920, 1080), fps=None, buffer_size=None):
     device = int(camera) if camera.isdecimal() else camera
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -31,6 +31,8 @@ def open_camera(camera, *, size=(1920, 1080), fps=None):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
     if fps is not None:
         cap.set(cv2.CAP_PROP_FPS, fps)
+    if buffer_size is not None:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
     return cap
 
 

@@ -18,6 +18,10 @@ class MotionStopped(RobotError):
     """A motion ended on a normal end-of-travel contact, not a latched fault."""
 
 
+class TransportUnavailable(RobotError):
+    """No usable reply arrived; motion POSTs must not be replayed."""
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -34,14 +38,14 @@ class RobotClient:
         self.timeout = timeout
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
-    def request(self, path, payload=None):
+    def request(self, path, payload=None, *, timeout=None):
         headers = {"X-SCARA-Token": self.token}
         data = None if payload is None else json.dumps(payload).encode()
         if data is not None:
             headers["Content-Type"] = "application/json"
         try:
             with self.opener.open(Request(self.url + "/" + path, data, headers),
-                                  timeout=self.timeout) as response:
+                                   timeout=self.timeout if timeout is None else timeout) as response:
                 value = json.loads(response.read(8192))
         except HTTPError as exc:
             try:
@@ -49,14 +53,16 @@ class RobotClient:
             except (OSError, KeyError, ValueError, TypeError):
                 message = exc.reason
             raise RobotError(f"{path}: {exc.code} {message}") from exc
-        except (URLError, OSError, ValueError) as exc:
-            raise RobotError(f"{path}: controller unavailable ({exc})") from exc
+        except (URLError, OSError) as exc:
+            raise TransportUnavailable(f"{path}: controller unavailable ({exc})") from exc
+        except ValueError as exc:
+            raise RobotError(f"{path}: invalid controller response") from exc
         if not isinstance(value, dict):
             raise RobotError(f"{path}: invalid controller response")
         return value
 
-    def status(self):
-        status = self.request("status")
+    def status(self, *, timeout=None):
+        status = self.request("status") if timeout is None else self.request("status", timeout=timeout)
         if (status.get("fw") != VERSION or not isinstance(status.get("boot"), str)
                 or type(status.get("command_id")) is not int
                 or type(status.get("homed")) is not bool
@@ -71,7 +77,7 @@ class RobotClient:
         return status
 
     def motion(self, path, payload, cancelled, timeout=120, expected_boot=None,
-               expected_command=None, observe=None):
+               expected_command=None, observe=None, recover_home_link=False):
         check_cancelled(cancelled)
         before = self.status()
         if expected_boot is not None and before["boot"] != expected_boot:
@@ -85,6 +91,8 @@ class RobotClient:
         if (boot != before["boot"] or type(command) is not int or
                 command != (before["command_id"] + 1) % 2**32):
             raise RobotError("Controller restarted or did not acknowledge the motion command.")
+        if path == "home" and recover_home_link:
+            return self.finish_home(boot, command, cancelled, timeout, observe)
         until = time.monotonic() + timeout
         while time.monotonic() < until:
             check_cancelled(cancelled)
@@ -115,6 +123,49 @@ class RobotClient:
             self.request("heartbeat", {"boot": boot, "command_id": command})
             cancelled.wait(0.12)
         raise RobotError(f"{path}: completion timeout")
+
+    def finish_home(self, boot, command, cancelled, timeout, observe):
+        """Prioritize the existing lease. Only repeat reads and fenced heartbeats."""
+        start = last_heartbeat = last_status = time.monotonic()
+        next_heartbeat = start
+        payload = {"boot": boot, "command_id": command}
+        while time.monotonic() < start + timeout:
+            check_cancelled(cancelled)
+            now = time.monotonic()
+            if now - min(last_heartbeat, last_status) >= 1.4:
+                raise TransportUnavailable("Homing link timed out; could not confirm heartbeat or status.")
+            if now >= next_heartbeat:
+                try:
+                    self.request("heartbeat", payload, timeout=.35)
+                    last_heartbeat = time.monotonic()
+                    next_heartbeat = last_heartbeat + .22
+                except TransportUnavailable:
+                    pass
+                except RobotError:
+                    # A firmware fault can increment the command before this heartbeat.
+                    # Read that fault below rather than renew an unknown command.
+                    next_heartbeat = time.monotonic() + .22
+            check_cancelled(cancelled)
+            try:
+                status = self.status(timeout=.35)
+            except TransportUnavailable:
+                cancelled.wait(.05)
+                continue
+            last_status = time.monotonic()
+            if observe is not None:
+                observe(status)
+            if status["boot"] != boot:
+                raise RobotError("Controller restarted during homing.")
+            if status["state"] in ("FAULT", "ESTOP", "HOLD"):
+                raise RobotError(f"Controller {status['state']}: {status.get('fault') or 'no detail'}")
+            if status["command_id"] != command:
+                raise RobotError("The active homing command changed.")
+            if status["state"] == "IDLE" and status["homed"]:
+                return status
+            if status["state"] != "HOMING":
+                raise RobotError("Controller did not finish homing.")
+            cancelled.wait(.12)
+        raise RobotError("home: completion timeout")
 
 
 def check_cancelled(event):

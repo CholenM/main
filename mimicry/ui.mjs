@@ -7,7 +7,8 @@ const ctx = canvas.getContext('2d');
 const keys = new Set();
 const displayedFrames = [];
 const movementKeys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'];
-let state, sample = {}, lastFrame = 0, generation = 0, frameError = '', actionError = '';
+let state, sample = {}, lastFrame = 0, drawnFrame = 0, generation = 0;
+let frameError = '', presenceError = '', actionError = '';
 let pendingObservation, sendingObservation = false;
 let active = !document.hidden && document.hasFocus();
 
@@ -44,10 +45,10 @@ function renderStatus() {
     $('tracking').textContent = `Tracking: ${fps} FPS · Preview: ${displayedFrames.length} FPS · ` +
       `Inference: ${inference_ms} ms · Latest frame: ${age_ms == null ? 'waiting' : `${age_ms} ms old`}`;
   }
-  $('error').textContent = actionError || frameError || state.camera_error || state.error ||
+  $('error').textContent = actionError || frameError || presenceError || state.camera_error || state.error ||
     (robot && !mimic?.enabled ? 'Mimicry is not enabled in this controller profile.' : '');
   const rows = [
-    ['Controller', robot?.state], ['Gestures', state.armed ? 'Armed' :
+    ['Controller', robot?.state], ['Gestures', state.paused ? 'Paused' : state.armed ? 'Armed' :
       state.pending ? 'Waiting for palm' : 'Disarmed'],
     ['Z bottom switch', robot ? (robot.limits?.z === 0 ? 'Pressed' : 'Clear') : null],
     ['Z zero', mimic?.z_referenced ? 'Set' : 'Not set'],
@@ -56,6 +57,11 @@ function renderStatus() {
     ...['j1', 'j2', 'z'].map(axis => [axis.toUpperCase(), robot?.pos?.[axis]]),
     ['Fault', robot?.fault],
   ];
+  if (robot?.home_axis) rows.push(['Homing phase', `${robot.home_axis.toUpperCase()} ${robot.home_phase ?? ''}`]);
+  if (state.last_home) {
+    const {message, axis, phase} = state.last_home;
+    rows.push(['Last homing', [message, axis?.toUpperCase(), phase].filter(Boolean).join(' · ')]);
+  }
   $('status').replaceChildren(...rows.flatMap(([name, value]) => {
     const label = document.createElement('dt'), description = document.createElement('dd');
     label.textContent = name;
@@ -127,6 +133,19 @@ async function sendObservation(observation) {
   }
 }
 
+async function sendPresence() {
+  try {
+    if (active && drawnFrame) {
+      await api('presence', {frame: drawnFrame});
+      presenceError = '';
+    }
+  } catch (error) {
+    presenceError = error.message;
+  } finally {
+    setTimeout(sendPresence, 100);
+  }
+}
+
 async function nextFrame() {
   const epoch = generation;
   let delay = virtual ? 35 : 0;
@@ -144,9 +163,9 @@ async function nextFrame() {
     }
     lastFrame = seq;
     sample = virtual ? fromKeyboard() : JSON.parse(response.headers.get('X-Hand-Observation'));
-    // Tracking reports and picture updates don't wait for each other.
-    sendObservation({frame: seq, ...sample});
-    await drawFrame(response, epoch);
+    if (virtual) sendObservation({frame: seq, ...sample});
+    await drawFrame(response, epoch, seq);
+    if (!virtual) frameError = '';
   } catch (error) {
     delay = 100;
     frameError = error.message;
@@ -157,7 +176,7 @@ async function nextFrame() {
   }
 }
 
-async function drawFrame(response, epoch) {
+async function drawFrame(response, epoch, sequence) {
   if (!virtual) {
     const bitmap = await createImageBitmap(await response.blob());
     if (active && epoch === generation) {
@@ -166,6 +185,7 @@ async function drawFrame(response, epoch) {
         canvas.height = bitmap.height;
       }
       ctx.drawImage(bitmap, 0, 0);
+      drawnFrame = sequence;
       displayedFrames.push(performance.now());
     }
     bitmap.close();
@@ -185,6 +205,7 @@ function focusChanged() {
   if (!active) {
     keys.clear();
     sample = {};
+    drawnFrame = 0;
     pendingObservation = undefined;
     api('disarm', {}, true).catch(() => {});
   }
@@ -196,6 +217,7 @@ document.addEventListener('visibilitychange', focusChanged);
 window.addEventListener('pagehide', () => {
   active = false;
   generation++;
+  drawnFrame = 0;
   pendingObservation = undefined;
   api('disarm', {}, true).catch(() => {});
 });
@@ -226,3 +248,4 @@ for (const action of ['center', 'arm', 'disarm', 'zero', 'home', 'reset', 'estop
 
 poll();
 nextFrame();
+if (!virtual) sendPresence();

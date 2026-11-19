@@ -47,7 +47,7 @@ class LiveCamera:
         cap = None
         try:
             cap = (scan.open_camera(self.device) if self.encode_preview else
-                   scan.open_camera(self.device, size=(1280, 720), fps=30))
+                   scan.open_camera(self.device, size=(1280, 720), fps=30, buffer_size=1))
             next_preview = 0
             while not self.closed.is_set():
                 ok, frame = cap.read()

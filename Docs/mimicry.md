@@ -16,8 +16,10 @@ on its USB camera feed and serves the result and preview. It doesn't upload fram
 to an external service. Use `--camera /dev/videoX` if needed.
 The dashboard shows measured **Tracking FPS** on the Jetson and **Preview FPS**
 in the browser, plus inference time and the last frame's age. They can differ:
-the camera and inference run independently of the SSH connection. Mimicry
-processes the newest available frame rather than queuing old frames.
+the Jetson processes the newest camera frame locally, without waiting for
+the preview to make a round trip. An armed session still requires an active
+browser tab and a recently displayed preview. If either feed stops, Mimicry
+disarms and reports whether local tracking or the browser/preview went stale.
 
 1. With Z on the bottom switch, select **Set Z Zero**. The simulated Z starts at
    the switch. The real controller only accepts zero if it is idle, the drill
@@ -33,8 +35,9 @@ processes the newest available frame rather than queuing old frames.
 4. Hold your palm left/right for J1 or up/down for Z. Only the dominant
    direction moves; **gestures never move J2**. If J1 is backwards for your view,
    relaunch with `--reverse-j1`. Neutral stops issuing jogs without disarming.
-   A fist, tracking loss, or leaving the tab disarms. Center and select **Arm
-   Gestures** again to resume.
+   A brief missed palm pauses motion. Return to the center box to resume; a palm
+   reappearing off-center never resumes a jog. A fist, multiple hands, stale frames,
+   a longer tracking loss, or leaving the tab disarms.
 
 ## Hardware opt-in
 
@@ -70,3 +73,9 @@ Motion gets one jog chunk at a time (up to 8 J1 or 30 Z microsteps). An already
 accepted chunk can finish after tracking stops. Firmware gives each accepted jog
 a non-renewable 250 ms deadline and never queues the next one. Verify stopping
 distance, direction, and the switch at low speed before routine use.
+
+If homing fails, check **Last homing** and the reported axis/phase. A link or
+`HEARTBEAT` timeout calls for checking the Jetson–ESP32 connection. An axis fault
+such as `HOME_TIMEOUT_J1_SEEK` or `HOME_SWITCH_STUCK` calls for checking that
+axis's direction, travel, switch, and wiring. Do not repeat homing against an
+obstruction or increase seek budgets to compensate for a switch or binding fault.
