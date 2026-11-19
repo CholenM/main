@@ -80,9 +80,14 @@ error is a fit diagnostic, not an independent accuracy check. Use the printed sc
 bar and a calibrated target for physical accuracy evidence. Missing corner tags or
 inconsistent registration reject the scan rather than exporting a job.
 
-Future integration needs repeatable homing, bounded position commands with completion
-and fault status, verified limit directions, a measured bed-to-base transform, a dry
-run and physical safety sign-off. `ESP32-Motor-Control/main.ino` is unchanged.
+## Robot workflow
+
+Run `./start.sh --serve --simulate-robot` to try **Start → Home → Park → Scan →
+Review → Approve dry run → Verify** with the local controller simulator. Add
+`--replay <image-or-run>` for an offline demonstration. Standard `--serve` remains
+vision-only. For the physical ESP32, see the [controller contract and commissioning
+guide](Docs/robot-contract.md). The sketch ships status-only until the limit and
+travel profile is verified; the workflow never enables the spindle.
 
 Run `python3 -m unittest discover -s tests -v` to regression-test the nominal print
 and inspection path from rasterized PDFs (`pdftoppm`, from `poppler-utils`, is required

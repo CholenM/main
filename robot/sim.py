@@ -1,0 +1,156 @@
+"""HTTP simulator for the same spindle-disabled controller contract."""
+
+import argparse
+import json
+import os
+import time
+import uuid
+from contextlib import contextmanager
+from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock, Thread
+
+from .client import AXES, VERSION
+
+
+class Controller:
+    def __init__(self, move_seconds=0.20, lease_seconds=2.0):
+        self.lock = Lock()
+        self.boot = uuid.uuid4().hex
+        self.command = 0
+        self.pos = dict.fromkeys(AXES, 0)
+        self.target = self.pos.copy()
+        self.state, self.homed, self.fault = "IDLE", False, None
+        self.finish = self.lease = 0
+        self.move_seconds, self.lease_seconds = move_seconds, lease_seconds
+
+    def handle(self, path, body=None):
+        with self.lock:
+            now = time.monotonic()
+            if self.state in ("HOMING", "MOVING"):
+                if self.lease <= min(now, self.finish):
+                    self.halt("FAULT", "HEARTBEAT")
+                elif self.finish <= now:
+                    self.pos = self.target.copy()
+                    self.state, self.homed = "IDLE", True
+            if path == "/status" and body is None:
+                return 200, {"fw": VERSION, "boot": self.boot, "command_id": self.command,
+                             "state": self.state, "homed": self.homed, "pos": self.pos.copy(),
+                             "target": self.target.copy(), "limits": dict.fromkeys(AXES, 1),
+                             "spindle": False, "fault": self.fault, "commissioned": True,
+                             "simulator": True}
+            if body is None:
+                return 404, {"error": "UNKNOWN_ENDPOINT"}
+            if path == "/heartbeat":
+                if (body.get("boot"), body.get("command_id")) != (self.boot, self.command):
+                    return 409, {"error": "COMMAND_CHANGED"}
+                if self.state in ("HOMING", "MOVING"):
+                    self.lease = now + self.lease_seconds
+                return 200, self.ack()
+            if path == "/spindle" and type(body.get("on")) is bool:
+                return (409, {"error": "SPINDLE_DISABLED"}) if body["on"] else (200, self.ack())
+            if path == "/stop" and self.state not in ("FAULT", "ESTOP"):
+                self.halt("HOLD", "STOP")
+                return 200, self.ack()
+            if path == "/estop":
+                self.halt("ESTOP", "ESTOP")
+                return 200, self.ack()
+            if path == "/reset" and self.state in ("HOLD", "FAULT", "ESTOP"):
+                self.halt("IDLE", None)
+                return 200, self.ack()
+            if path in ("/home", "/move") and self.state == "IDLE":
+                if (body.get("boot"), body.get("command_id")) != (self.boot, self.command):
+                    return 409, {"error": "COMMAND_CHANGED"}
+                if path == "/home":
+                    self.state, self.homed = "HOMING", False
+                    self.target = dict.fromkeys(AXES, 0)
+                else:
+                    axis, target, feed = (body.get(k) for k in ("axis", "to", "feed"))
+                    if (axis not in AXES or type(target) is not int or type(feed) is not int
+                            or not 1000 <= feed <= 20000 or not (-10000 <= target <= 10000)
+                            or (axis == "z" and target != 0)):
+                        return 400, {"error": "INVALID_TARGET_OR_FEED"}
+                    if not self.homed or self.pos["z"] != 0:
+                        return 409, {"error": "NOT_HOMED_OR_SAFE_Z"}
+                    self.state = "MOVING"
+                    self.target = self.pos | {axis: target}
+                self.command = (self.command + 1) % 2**32
+                self.finish, self.lease = now+self.move_seconds, now+self.lease_seconds
+                return 202, self.ack()
+            return 409, {"error": "INVALID_STATE_OR_COMMAND"}
+
+    def ack(self):
+        return {"boot": self.boot, "command_id": self.command}
+
+    def halt(self, state, fault):
+        self.command = (self.command + 1) % 2**32
+        self.state, self.fault, self.homed = state, fault, False
+        self.target = self.pos.copy()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def __init__(self, *args, controller, token, **kwargs):
+        self.controller, self.token = controller, token
+        super().__init__(*args, **kwargs)
+
+    def log_message(self, *_):
+        pass
+
+    def respond(self, status, value):
+        data = json.dumps(value).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def dispatch(self, post):
+        if self.headers.get("X-SCARA-Token") != self.token:
+            self.respond(403, {"error": "UNAUTHORIZED"})
+            return
+        body = None
+        if post:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= length <= 512:
+                    raise ValueError
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError
+            except (ValueError, TypeError):
+                self.respond(400, {"error": "INVALID_JSON"})
+                return
+        self.respond(*self.controller.handle(self.path, body))
+
+    def do_GET(self):
+        self.dispatch(False)
+
+    def do_POST(self):
+        self.dispatch(True)
+
+
+@contextmanager
+def server(port=0, controller=None):
+    token = os.urandom(16).hex()
+    handler = partial(Handler, controller=controller or Controller(), token=token)
+    with ThreadingHTTPServer(("127.0.0.1", port), handler) as http:
+        thread = Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{http.server_port}", token
+        finally:
+            http.shutdown()
+            thread.join()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=8765)
+    options = parser.parse_args()
+    with server(options.port) as (url, token):
+        print(f"Simulator: {url}, X-SCARA-Token: {token}", flush=True)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass

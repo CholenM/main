@@ -2,3 +2,5 @@ Docs/plans
 __pycache__/
 /runs/
 Docs/print
+/ESP32-Motor-Control/secrets.h
+/ESP32-Motor-Control/machine_config.h

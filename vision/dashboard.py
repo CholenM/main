@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import cv2
 
 from . import fixture, scan
+from robot.client import RobotError
 
 FILES = ("raw.png", "rectified.png", "overlay.png", "report.md", "detections.csv",
          "errors.csv", "ground_truth.csv", "registration.json", "job.json")
@@ -90,6 +91,7 @@ class Session:
         self.camera = None
         self.guard = Lock()
         self.last = None
+        self.workflow = None
 
     def state(self):
         camera = self.camera
@@ -97,7 +99,8 @@ class Session:
                 "ready": self.replay is not None or bool(camera and camera.frame is not None and not camera.error),
                 "camera_error": camera.error if camera else None, "busy": self.guard.locked(),
                 "verify": self.args.verify,
-                "last": self.last[1] if self.last else None}
+                "last": self.last[1] if self.last else None,
+                "workflow": self.workflow.describe() if self.workflow else None}
 
     def measure(self):
         if not self.guard.acquire(blocking=False):
@@ -158,10 +161,21 @@ class Dashboard(BaseHTTPRequestHandler):
             self.send_data((fixture.ROOT / "vision" / "dashboard.html").read_bytes(),
                            "text/html; charset=utf-8")
         elif path == "/api/state":
+            if self.session.workflow:
+                self.session.workflow.poll()
             self.json(self.session.state())
         elif path == "/stream.mjpg" and self.session.camera:
             self.stream(self.session.camera)
         elif path.startswith("/run/"):
+            workflow = self.session.workflow
+            if workflow:
+                with workflow.condition:
+                    directory = workflow.directory
+                if directory and path == f"/run/{directory.name}/plan.json":
+                    plan = directory / "plan.json"
+                    if plan.is_file():
+                        self.send_data(plan.read_bytes(), "application/json")
+                        return
             last = self.session.last
             if last:
                 directory, result = last
@@ -196,19 +210,48 @@ class Dashboard(BaseHTTPRequestHandler):
             pass  # Browser switched views or disconnected.
 
     def do_POST(self):
-        if self.path != "/api/scan":
+        workflow = self.session.workflow
+        if self.path != "/api/scan" and not (workflow and self.path.startswith("/api/robot/")):
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
+        if workflow and not workflow.simulated:
+            port = self.server.server_port
+            hosts = {f"localhost:{port}", f"127.0.0.1:{port}"}
+            if self.headers.get("Host") not in hosts:
+                self.json({"error": "Physical workflow is available only through loopback."}, 403)
+                return
         if origin and urlsplit(origin).netloc != self.headers.get("Host"):
             self.json({"error": "Cross-origin scan requests are not allowed."}, 403)
             return
         try:
-            result = self.session.measure()
+            if self.path.startswith("/api/robot/"):
+                action = self.path.removeprefix("/api/robot/")
+                if action == "stop":
+                    workflow.stop()
+                elif action == "execute":
+                    try:
+                        size = int(self.headers.get("Content-Length", "0"))
+                        if not 1 <= size <= 256:
+                            raise ValueError
+                        review_id = json.loads(self.rfile.read(size))["review_id"]
+                    except (ValueError, TypeError, KeyError):
+                        self.json({"error": "Provide the current review_id."}, 400)
+                        return
+                    workflow.launch(action, review_id)
+                else:
+                    workflow.launch(action)
+                result = workflow.describe()
+            else:
+                if workflow:
+                    raise RobotError("Use Start to home, park and scan in robot workflow mode.")
+                result = self.session.measure()
         except BlockingIOError as exc:
             self.json({"error": str(exc)}, 409)
         except scan.ScanError as exc:
             self.json({"error": str(exc)}, 503)
+        except RobotError as exc:
+            self.json({"error": str(exc)}, 409)
         except OSError as exc:
             self.json({"error": str(exc)}, 500)
         else:

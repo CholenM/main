@@ -28,6 +28,11 @@ button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
 button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 button:disabled{cursor:default;opacity:.5}
 .primary{margin-top:15px;width:100%;background:var(--accent);color:#132321;font-weight:750;padding:11px}
+.stop{background:#3b2628;color:var(--bad)}
+.workflow{margin-top:15px}
+.stages{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.stages span{border:1px solid var(--line);border-radius:4px;padding:3px 7px;font-size:11px;color:var(--muted)}
+.stages .current{border-color:var(--accent);color:var(--accent)}
 .summary{margin:16px 0}
 .summary strong{display:block;font-size:clamp(19px,2.8vw,30px);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
 #message{margin-top:11px;min-height:1.5em}
@@ -62,19 +67,30 @@ footer{margin-top:12px;color:var(--muted);font-size:12px}
       </div>
       <p class="muted">235 × 127 mm fixture · Ø3 mm nominal<br>Scan uses a full-resolution snapshot.</p>
       <button class="primary" id="scan" type="button" disabled>Scan <span aria-hidden="true">· S</span></button>
+      <div id="workflow" class="workflow" hidden>
+        <div class="bar"><span class="badge" id="robot-status">Robot offline</span>
+          <button type="button" class="stop" id="robot-stop">Network stop</button></div>
+        <div class="stages" id="stages" aria-label="Workflow progress"></div>
+        <button type="button" class="primary" id="robot-action" disabled>Start</button>
+        <p class="muted" id="calibration-summary"></p>
+      </div>
       <p class="muted" id="message" role="status"></p>
     </section>
   </div>
   <section class="card table" aria-label="Measured points">
-    <div class="bar"><h2>Measured points</h2><div id="links" class="actions"></div></div>
-    <table><thead><tr><th scope="col">ID</th><th scope="col">X (mm)</th><th scope="col">Y (mm)</th><th scope="col">Ø (mm)</th><th scope="col">Error (mm)</th><th scope="col">Check</th></tr></thead>
+    <div class="bar"><h2>Measured points</h2><div class="actions">
+      <div id="links" class="actions"></div><a id="plan-file" download="plan.json" hidden>Plan JSON</a>
+    </div></div>
+    <table><thead><tr><th scope="col">ID</th><th scope="col">X (mm)</th><th scope="col">Y (mm)</th><th scope="col">Ø (mm)</th><th scope="col">Error (mm)</th><th scope="col">Check</th><th class="robot-column" scope="col" hidden>Achievable XY (mm)</th><th class="robot-column" scope="col" hidden>J1 / J2 (steps)</th><th class="robot-column" scope="col" hidden>Progress</th></tr></thead>
     <tbody id="points"><tr><td colspan="6" class="muted">Scan to see coordinates.</td></tr></tbody></table>
   </section>
-  <footer>Fixture origin: lower-left tag center · X right, Y up · No robot motion</footer>
+  <footer id="footer">Fixture origin: lower-left tag center · X right, Y up · No robot motion</footer>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 let state, last, mode = 'live', requesting = false, error = '';
+let robotAction, robotPending = false;
+const phases = ['HOMING','PARKING','SCANNING','PLANNING','REVIEW','CHECKING','EXECUTING','VERIFYING','DONE'];
 const number = value => value != null && value !== '' ? Number(value).toFixed(2) : '—';
 function image() {
   const replay = state?.mode === 'replay';
@@ -88,7 +104,8 @@ function image() {
   $('view').alt = mode === 'result' ? 'Frozen scan result' : 'Live camera preview';
   $('view').hidden = !source;
   $('placeholder').hidden = !!source;
-  $('placeholder').textContent = state?.camera_error || 'Waiting for camera…';
+  $('placeholder').textContent = state?.camera_error ||
+    (replay && state?.workflow ? 'Saved fixture image · press Start to simulate.' : 'Waiting for camera…');
   if (source && $('view').getAttribute('src') !== source) $('view').src = source;
   if (!source) $('view').removeAttribute('src');
 }
@@ -104,7 +121,7 @@ function result(value) {
   $('points').replaceChildren();
   for (const row of rows) {
     const p = pts.get(row.id);
-    const tr = document.createElement('tr');
+    const tr = document.createElement('tr'); tr.dataset.id = row.id;
     for (const n of [row.id, number(p?.x_mm), number(p?.y_mm), number(p?.diameter_mm),
                      number(row.radial_mm), row.status || 'Review']) {
       const td = document.createElement('td'); td.textContent = n; tr.append(td);
@@ -121,6 +138,52 @@ function result(value) {
     const a = document.createElement('a'); a.href = value.files[name]; a.textContent = label; a.download = name; $('links').append(a);
   }
 }
+function renderRobot() {
+  const w = state?.workflow;
+  $('workflow').hidden = !w;
+  $('plan-file').hidden = !w?.plan_url;
+  if (w?.plan_url) $('plan-file').href = w.plan_url;
+  $('scan').hidden = !!w;
+  $('footer').textContent = 'Fixture origin: lower-left tag center · X right, Y up · ' +
+    (!w ? 'No robot motion' : w.simulated ? 'Simulation only' : 'Spindle-off commissioning only');
+  document.querySelectorAll('th.robot-column').forEach(th => th.hidden = !w);
+  if (!w) return;
+  $('robot-status').textContent = w.status ? `${w.simulated ? 'Sim' : 'Robot'} · ${w.status.state}` +
+    (w.status.commissioned ? '' : ' · status only') : 'Robot offline';
+  $('robot-status').className = 'badge ' + (!w.status || ['FAULT','ESTOP'].includes(w.status.state) ? 'bad' : 'ok');
+  $('stages').replaceChildren();
+  for (const phase of phases) {
+    const item = document.createElement('span'); item.textContent = phase;
+    if (phase === w.stage) item.className = 'current';
+    $('stages').append(item);
+  }
+  robotAction = null;
+  let label = w.stage.toLowerCase().replace(/^./, letter => letter.toUpperCase())+'…';
+  if (['FAULT','ESTOP'].includes(w.stage)) { label = 'Reset'; if (w.status) robotAction = 'reset'; }
+  else if (w.can_execute) { label = 'Approve dry run'; if (w.status?.state === 'IDLE') robotAction = 'execute'; }
+  else if (['IDLE','DONE','REVIEW'].includes(w.stage)) {
+    label = w.stage === 'REVIEW' ? 'Rescan with homing' : 'Start';
+    if (state.ready && w.status?.commissioned && w.status?.state === 'IDLE' && w.park_configured) robotAction = 'start';
+    else if (state.ready && w.status && ['FAULT','ESTOP','HOLD'].includes(w.status.state)) {
+      label = 'Reset'; robotAction = 'reset';
+    }
+  }
+  $('robot-action').textContent = label;
+  $('robot-action').disabled = !robotAction || robotPending;
+  $('calibration-summary').textContent = w.residual_mm == null ? '' :
+    `Held-out check max: ${number(w.residual_mm)} mm. Rounded positions shown below.`;
+  if (!error) $('message').textContent = w.link_error || w.message ||
+    (!w.park_configured ? 'Set and verify the camera-clear park pose.' : last?.message || '');
+  const plan = new Map(w.plan.map(p => [p.id, p]));
+  for (const tr of $('points').querySelectorAll('tr[data-id]')) {
+    const p = plan.get(tr.dataset.id);
+    const data = [p ? `${p.achievable_mm.map(number).join(', ')} (Δ ${number(p.rounding_mm)})` : '—',
+                  p ? `${p.steps.j1} / ${p.steps.j2}` : '—', p?.state || '—'];
+    for (let i=0;i<data.length;i++) {
+      const td = tr.cells[6+i] || tr.insertCell(); td.textContent = data[i];
+    }
+  }
+}
 function controls() {
   const busy = requesting || state?.busy;
   const label = state?.camera_error ? 'Camera offline' : busy ? 'Scanning' :
@@ -131,12 +194,14 @@ function controls() {
   $('scan').textContent = busy ? 'Scanning…' : state?.verify ? 'Verify · S' : 'Scan · S';
   $('message').textContent = error || last?.message || (state?.verify ? 'Inspection mode · no job export.' : '');
   image();
+  renderRobot();
 }
 async function refresh() {
   try {
     const res = await fetch('/api/state');
     if (!res.ok) throw Error('Dashboard disconnected.');
     state = await res.json();
+    if (state.workflow && state.last && last?.id !== state.last.id) mode = 'result';
     result(state.last);
     if (state.mode === 'replay') mode = 'result';
     if (!requesting && error === 'Dashboard disconnected.') error = '';
@@ -158,8 +223,26 @@ async function measure() {
 $('live').onclick = () => { mode = 'live'; image(); };
 $('result').onclick = () => { mode = 'result'; image(); };
 $('scan').onclick = measure;
+async function command(action) {
+  if (!action || (robotPending && action !== 'stop')) return;
+  robotPending = true; error = ''; controls();
+  try {
+    const options = {method:'POST'};
+    if (action === 'execute') {
+      options.headers = {'Content-Type':'application/json'};
+      options.body = JSON.stringify({review_id:state.workflow.review_id});
+    }
+    const res = await fetch('/api/robot/'+action, options);
+    const payload = await res.json();
+    if (!res.ok) throw Error(payload.error || 'Robot command failed.');
+    if (state) state.workflow = payload;
+  } catch (err) { error = err.message; }
+  finally { robotPending = false; controls(); }
+}
+$('robot-action').onclick = () => command(robotAction);
+$('robot-stop').onclick = () => command('stop');
 document.addEventListener('keydown', event => {
-  if (event.key.toLowerCase() === 's' && !event.repeat && !event.metaKey && !event.ctrlKey && !event.altKey) measure();
+  if (!state?.workflow && event.key.toLowerCase() === 's' && !event.repeat && !event.metaKey && !event.ctrlKey && !event.altKey) measure();
 });
 refresh();
 </script>
