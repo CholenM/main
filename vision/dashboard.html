@@ -33,6 +33,14 @@ button:disabled{cursor:default;opacity:.5}
 .stages{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .stages span{border:1px solid var(--line);border-radius:4px;padding:3px 7px;font-size:11px;color:var(--muted)}
 .stages .current{border-color:var(--accent);color:var(--accent)}
+.robot-details,.manual,.pose-form{display:grid;gap:8px;margin-top:12px}
+.robot-details{font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.manual .actions,.pose-form .actions{justify-content:flex-start}
+.manual label,.pose-form label{display:grid;gap:4px;font-size:13px}
+.manual select,.pose-form select,.pose-form input{font:inherit;color:var(--txt);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px;max-width:100%}
+.pose-form .xy{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.pose-form .xy input{width:100%;min-width:0}
+.simulation-map{width:100%;height:auto;background:#101719;border:1px solid var(--line);border-radius:8px}
 .summary{margin:16px 0}
 .summary strong{display:block;font-size:clamp(19px,2.8vw,30px);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
 #message{margin-top:11px;min-height:1.5em}
@@ -45,20 +53,37 @@ footer{margin-top:12px;color:var(--muted);font-size:12px}
 [hidden]{display:none!important}
 @media(max-width:730px){.layout{grid-template-columns:1fr}.image img{max-height:none}}
 </style>
-<main>
+<main id="app">
   <header>
-    <div><p class="eyebrow">Robotics lab / inspection</p><h1>SCARA Vision</h1></div>
-    <span class="badge" id="connection">Connecting</span>
+    <div><p class="eyebrow">Robotics lab</p><h1 id="page-title">SCARA Vision</h1></div>
+    <div class="actions">
+      <a id="mode-link" href="/sim/" hidden>Run simulation</a>
+      <nav id="robot-nav" class="actions" aria-label="Dashboard views" hidden>
+        <a id="vision-link" href="/">Vision workflow</a>
+        <a id="manual-link" href="/manual">Manual control</a>
+      </nav>
+      <span class="badge" id="connection">Connecting</span>
+    </div>
   </header>
   <div class="layout">
-    <section class="card" aria-label="Camera and scan image">
+    <section class="card" id="camera-panel" aria-label="Camera and scan image">
       <div class="bar"><h2 id="image-title">Live preview</h2><div class="actions">
         <button id="live" type="button" aria-pressed="true">Live</button>
         <button id="result" type="button" aria-pressed="false" disabled>Result</button>
       </div></div>
       <div class="image"><img id="view" alt="" hidden><span class="muted" id="placeholder">Waiting for camera…</span></div>
     </section>
-    <section class="card" aria-label="Scan controls">
+    <section class="card" aria-label="Dashboard controls">
+      <form class="pose-form" id="connect-form" hidden>
+        <h2>Connect ESP32</h2>
+        <label>Controller IPv4 <input id="controller-ip" value="10.42.0.16" required></label>
+        <label>Controller token <input id="controller-token" type="password" autocomplete="off" required></label>
+        <div class="actions"><button type="submit">Connect</button><small>Session only · no motion on connect</small></div>
+      </form>
+      <label id="simulation-source" class="pose-form" hidden>Simulation image
+        <select id="source-select"><option value="demo">Built-in fixture</option><option value="live">Live camera</option></select>
+      </label>
+      <div id="scan-controls">
       <div class="bar"><h2>Last scan</h2><span id="status" class="badge">Not scanned</span></div>
       <div class="summary">
         <div><small>Detected</small><strong id="count">—</strong></div>
@@ -67,17 +92,83 @@ footer{margin-top:12px;color:var(--muted);font-size:12px}
       </div>
       <p class="muted">235 × 127 mm fixture · Ø3 mm nominal<br>Scan uses a full-resolution snapshot.</p>
       <button class="primary" id="scan" type="button" disabled>Scan <span aria-hidden="true">· S</span></button>
+      </div>
       <div id="workflow" class="workflow" hidden>
         <div class="bar"><span class="badge" id="robot-status">Robot offline</span>
           <button type="button" class="stop" id="robot-stop">Network stop</button></div>
         <div class="stages" id="stages" aria-label="Workflow progress"></div>
         <button type="button" class="primary" id="robot-action" disabled>Start</button>
         <p class="muted" id="calibration-summary"></p>
+        <div class="robot-details" aria-label="Robot status">
+          <strong>Commanded joint steps · no encoders</strong>
+          <p id="joint-position">Z — · J1 — · J2 —</p>
+          <small id="tool-coordinates"></small>
+          <small id="joint-target"></small>
+          <small id="robot-diagnostics"></small>
+          <small id="robot-boot"></small>
+          <small id="home-trace-summary"></small>
+          <div class="actions" id="home-trace-files"></div>
+        </div>
+        <section id="manual-panel" class="manual" aria-labelledby="manual-title" hidden>
+          <h2 id="manual-title">Manual control</h2>
+          <small id="manual-state" class="muted"></small>
+          <div class="manual">
+            <div class="actions">
+              <button type="button" id="home-only">Home only</button>
+              <small id="park-pose">Park not configured</small>
+            </div>
+            <div id="manual-moves" class="manual" hidden>
+              <label id="jog-size">Jog increment (steps)
+                <select id="jog-step"><option>10</option><option>25</option><option>50</option></select>
+              </label>
+              <div class="actions">
+                <button type="button" data-joint="j1" data-sign="-1">J1 −</button>
+                <button type="button" data-joint="j1" data-sign="1">J1 +</button>
+                <button type="button" data-joint="j2" data-sign="-1">J2 −</button>
+                <button type="button" data-joint="j2" data-sign="1">J2 +</button>
+              </div>
+              <small id="nudge-budget"></small>
+              <div class="actions">
+                <button type="button" id="save-park">Save as park (session)</button>
+                <button type="button" id="return-park">Return to park</button>
+              </div>
+              <small>Verify camera clearance and the full J1 → J2 path before saving or returning to park.</small>
+              <div class="actions">
+                <button type="button" id="z-minus" disabled>Z −</button>
+                <button type="button" id="z-plus" disabled>Z +</button>
+                <button type="button" id="drill-toggle" aria-pressed="false" disabled>Drill off</button>
+              </div>
+              <small id="tools-note"></small>
+            </div>
+          </div>
+          <form class="pose-form" id="pose-form">
+            <label>Pose label <input id="pose-label" maxlength="80" placeholder="e.g. Park or sample 01"></label>
+            <label>Role <select id="pose-role">
+              <option value="observation">Observation</option><option value="fit">Calibration fit</option>
+              <option value="check">Calibration check</option>
+            </select></label>
+            <div class="xy">
+              <label>Measured fixture X (mm) <input id="pose-x" type="number" step="any"></label>
+              <label>Measured fixture Y (mm) <input id="pose-y" type="number" step="any"></label>
+            </div>
+            <div class="actions">
+              <button type="submit" id="record-pose">Record pose</button>
+              <a id="pose-csv" href="/api/robot/poses.csv" download="poses.csv">Download pose CSV</a>
+            </div>
+          </form>
+        </section>
       </div>
       <p class="muted" id="message" role="status"></p>
     </section>
   </div>
-  <section class="card table" aria-label="Measured points">
+  <section id="simulation-evidence" class="card workflow" hidden>
+    <div class="bar"><h2>Simulated target visits</h2><a id="dry-run-file" download="dry_run.json" hidden>Download visit log</a></div>
+    <p class="muted" id="simulation-progress"></p>
+    <svg id="simulation-map" class="simulation-map" viewBox="-7 -7 249 141" role="img"
+         aria-label="Fixture target map, showing confirmed simulator visits"></svg>
+    <small>Lines connect confirmed visit positions; they are not a measured arm trajectory.</small>
+  </section>
+  <section class="card table" id="points-panel" aria-label="Measured points">
     <div class="bar"><h2>Measured points</h2><div class="actions">
       <div id="links" class="actions"></div><a id="plan-file" download="plan.json" hidden>Plan JSON</a>
     </div></div>
@@ -88,19 +179,27 @@ footer{margin-top:12px;color:var(--muted);font-size:12px}
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const simView = location.pathname === '/sim' || location.pathname.startsWith('/sim/');
+const prefix = simView ? '/sim' : '';
+const onManualPage = location.pathname === prefix+'/manual';
 let state, last, mode = 'live', requesting = false, error = '';
 let robotAction, robotPending = false;
-const phases = ['HOMING','PARKING','SCANNING','PLANNING','REVIEW','CHECKING','EXECUTING','VERIFYING','DONE'];
+const phases = ['Homing','Scanning','Planning','Executing','Done'];
+const displayPhase = {HOMING:0, PARKING:0, SCANNING:1, PLANNING:2, REVIEW:2,
+                      CHECKING:3, EXECUTING:3, VERIFYING:3, DONE:4};
 const number = value => value != null && value !== '' ? Number(value).toFixed(2) : '—';
 function image() {
   const replay = state?.mode === 'replay';
-  const source = mode === 'result' ? last?.files['overlay.png'] || last?.files['raw.png'] :
-    state?.ready && !replay ? '/stream.mjpg' : null;
-  $('live').disabled = replay;
+  const file = mode === 'result' ? last?.files['overlay.png'] || last?.files['raw.png'] :
+    state?.demo_source === 'demo' ? '/demo.jpg' : state?.ready && !replay ? '/stream.mjpg' : null;
+  const source = file ? prefix+file : null;
+  $('live').disabled = replay && state?.demo_source !== 'demo';
+  $('live').textContent = state?.demo_source === 'demo' ? 'Fixture image' : 'Live';
   $('result').disabled = !last;
   $('live').setAttribute('aria-pressed', mode === 'live');
   $('result').setAttribute('aria-pressed', mode === 'result');
-  $('image-title').textContent = mode === 'result' ? 'Scan result' : 'Live preview';
+  $('image-title').textContent = mode === 'result' ? 'Scan result' :
+    state?.demo_source === 'demo' ? 'Built-in fixture image' : 'Live preview';
   $('view').alt = mode === 'result' ? 'Frozen scan result' : 'Live camera preview';
   $('view').hidden = !source;
   $('placeholder').hidden = !!source;
@@ -135,45 +234,182 @@ function result(value) {
   $('links').replaceChildren();
   for (const [name, label] of [['detections.csv','Coordinates CSV'],['report.md','Report'],['job.json','Job JSON']]) {
     if (!value.files[name]) continue;
-    const a = document.createElement('a'); a.href = value.files[name]; a.textContent = label; a.download = name; $('links').append(a);
+    const a = document.createElement('a'); a.href = prefix+value.files[name]; a.textContent = label; a.download = name; $('links').append(a);
+  }
+}
+function renderSimulation(w, manualView) {
+  $('simulation-source').hidden = !state?.demo_source || manualView;
+  $('source-select').disabled = !!w?.busy || robotPending || !['IDLE','DONE','REVIEW'].includes(w?.stage);
+  if (state?.demo_source) $('source-select').value = state.demo_source;
+  $('simulation-evidence').hidden = !w?.simulated || manualView;
+  if (!w?.simulated || manualView) return;
+  const visited = w.plan.filter(point => point.state === 'visited' && point.confirmed_xy_mm);
+  $('simulation-progress').textContent = w.plan.length
+    ? `${visited.length} / ${w.plan.length} targets confirmed by the simulator`
+    : 'Press Start to analyze the image. Review the plan, then approve the simulated run.';
+  $('dry-run-file').hidden = !w.dry_run_url;
+  if (w.dry_run_url) $('dry-run-file').href = prefix+w.dry_run_url;
+  const map = $('simulation-map');
+  map.replaceChildren();
+  const shape = (tag, attributes) => {
+    const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [name,value] of Object.entries(attributes)) node.setAttribute(name, value);
+    map.append(node);
+    return node;
+  };
+  shape('rect', {x:0,y:0,width:235,height:127,rx:2,fill:'none',stroke:'#53666a'});
+  if (visited.length > 1) shape('polyline', {fill:'none',stroke:'#77e3c4','stroke-width':1.5,
+    points:visited.map(({confirmed_xy_mm:[x,y]}) => `${x},${127-y}`).join(' ')});
+  for (const point of w.plan) {
+    const [x,y] = point.confirmed_xy_mm || point.requested_mm;
+    const color = point.state === 'visited' ? '#77e3c4' : point.state === 'moving' ? '#f8d386' : '#97aaae';
+    shape('circle',{cx:x,cy:127-y,r:2.8,fill:color});
+    shape('text',{x:x+4,y:127-y-3,fill:color,'font-size':6}).textContent = point.id;
   }
 }
 function renderRobot() {
   const w = state?.workflow;
+  const manualView = onManualPage || !!w?.manual_only;
+  $('connect-form').hidden = !state?.can_connect;
+  $('mode-link').hidden = !state?.has_simulation;
+  $('mode-link').textContent = simView ? 'Hardware / live vision' : 'Run simulation';
+  $('mode-link').href = simView ? '/' : '/sim/';
+  $('vision-link').href = prefix+'/';
+  $('manual-link').href = prefix+'/manual';
+  $('pose-csv').href = prefix+'/api/robot/poses.csv';
+  renderSimulation(w, manualView);
+  $('page-title').textContent = manualView ? 'SCARA Manual Control' : 'SCARA Vision';
+  for (const id of ['scan-controls','points-panel','stages']) $(id).hidden = manualView;
+  $('robot-nav').hidden = !w;
+  $('vision-link').hidden = !!w?.manual_only;
+  $('manual-link').hidden = manualView;
+  $('manual-panel').hidden = !manualView;
   $('workflow').hidden = !w;
   $('plan-file').hidden = !w?.plan_url;
-  if (w?.plan_url) $('plan-file').href = w.plan_url;
+  if (w?.plan_url) $('plan-file').href = prefix+w.plan_url;
   $('scan').hidden = !!w;
-  $('footer').textContent = 'Fixture origin: lower-left tag center · X right, Y up · ' +
-    (!w ? 'No robot motion' : w.simulated ? 'Simulation only' : 'Spindle-off commissioning only');
+  $('footer').textContent = manualView
+    ? `Fixed Z · ${w?.simulated ? 'Simulation only' : 'Spindle off'} · Manual moves only on this page`
+    : 'Fixture origin: lower-left tag center · X right, Y up · ' +
+      (!w ? 'No robot motion' : w.simulated ? 'Simulation only' : 'Spindle-off commissioning only');
   document.querySelectorAll('th.robot-column').forEach(th => th.hidden = !w);
   if (!w) return;
   $('robot-status').textContent = w.status ? `${w.simulated ? 'Sim' : 'Robot'} · ${w.status.state}` +
     (w.status.commissioned ? '' : ' · status only') : 'Robot offline';
   $('robot-status').className = 'badge ' + (!w.status || ['FAULT','ESTOP'].includes(w.status.state) ? 'bad' : 'ok');
   $('stages').replaceChildren();
-  for (const phase of phases) {
+  for (const [index, phase] of phases.entries()) {
     const item = document.createElement('span'); item.textContent = phase;
-    if (phase === w.stage) item.className = 'current';
+    if (index === displayPhase[w.stage]) {
+      item.className = 'current';
+      item.setAttribute('aria-current', 'step');
+    }
     $('stages').append(item);
   }
   robotAction = null;
   let label = w.stage.toLowerCase().replace(/^./, letter => letter.toUpperCase())+'…';
   if (['FAULT','ESTOP'].includes(w.stage)) { label = 'Reset'; if (w.status) robotAction = 'reset'; }
-  else if (w.can_execute) { label = 'Approve dry run'; if (w.status?.state === 'IDLE') robotAction = 'execute'; }
+  else if (!manualView && w.can_execute) { label = 'Approve & execute dry run'; if (w.status?.state === 'IDLE' && w.status.homed) robotAction = 'execute'; }
   else if (['IDLE','DONE','REVIEW'].includes(w.stage)) {
     label = w.stage === 'REVIEW' ? 'Rescan with homing' : 'Start';
-    if (state.ready && w.status?.commissioned && w.status?.state === 'IDLE' && w.park_configured) robotAction = 'start';
-    else if (state.ready && w.status && ['FAULT','ESTOP','HOLD'].includes(w.status.state)) {
+    if (!manualView && state.ready && w.status?.commissioned && w.status?.state === 'IDLE' && w.park_configured) robotAction = 'start';
+    else if (w.status && ['FAULT','ESTOP','HOLD'].includes(w.status.state)) {
       label = 'Reset'; robotAction = 'reset';
     }
   }
   $('robot-action').textContent = label;
-  $('robot-action').disabled = !robotAction || robotPending;
+  $('robot-action').hidden = manualView && robotAction !== 'reset';
+  $('robot-action').disabled = !robotAction || robotPending || w.busy;
   $('calibration-summary').textContent = w.residual_mm == null ? '' :
     `Held-out check max: ${number(w.residual_mm)} mm. Rounded positions shown below.`;
   if (!error) $('message').textContent = w.link_error || w.message ||
-    (!w.park_configured ? 'Set and verify the camera-clear park pose.' : last?.message || '');
+    (!manualView && !w.park_configured ? 'Set and verify the camera-clear park pose for scans.' : '');
+  const status = w.status, bounds = status?.bounds;
+  const jointText = p => `J1 ${p?.j1 ?? '—'} · J2 ${p?.j2 ?? '—'}`;
+  const virtual = w.virtual_tools;
+  $('joint-position').textContent =
+    `Z ${virtual ? virtual.z_steps : status ? 'fixed' : '—'} · ${jointText(status?.pos)}`;
+  $('tool-coordinates').textContent = w.tool_xy_mm
+    ? `${w.simulated ? 'Simulated' : 'Estimated'} tool XY: ${number(w.tool_xy_mm[0])}, ${number(w.tool_xy_mm[1])} mm`
+    : 'Tool XY unavailable outside a homed, calibrated region.';
+  $('joint-target').textContent = status?.state === 'HOMING' ? 'Target: homing switches' :
+    `Target steps: ${jointText(status?.target)}`;
+  const limits = ['z','j1','j2'].map(axis => {
+    const value = status?.limits?.[axis];
+    return `${axis.toUpperCase()} ${value === 0 ? 'pressed' : value === 1 ? 'clear' : '—'}`;
+  });
+  $('robot-diagnostics').textContent = status ?
+    [status.homed ? 'Homed' : 'Not homed', `Limits: ${limits.join(' / ')}`,
+     status.home_axis && `${status.home_axis.toUpperCase()} ${status.home_phase}`,
+     status.fault].filter(Boolean).join(' · ') : 'Controller offline';
+  $('robot-boot').textContent = status ? `Boot: ${status.boot} · Command: ${status.command_id}` : '';
+  const trace = w.home_trace;
+  $('home-trace-summary').textContent = w.home_trace_error ||
+    (trace ? [`Last home: ${trace.outcome}`, `${trace.sample_count} samples`, trace.error]
+      .filter(Boolean).join(' · ') : '');
+  $('home-trace-files').replaceChildren();
+  const traceLabels = {'trace.csv':'Homing CSV', 'summary.json':'Summary JSON',
+    'before.jpg':'Before photo', 'after.jpg':'After photo'};
+  for (const name of trace?.files || []) {
+    const link = document.createElement('a');
+    link.href = `${prefix}/homing/${trace.id}/${name}`;
+    link.download = name;
+    link.textContent = traceLabels[name];
+    $('home-trace-files').append(link);
+  }
+  $('park-pose').textContent = w.park_configured ? `Park steps: ${jointText(w.park_steps)}` : 'No park saved (optional for jogging)';
+  const idle = ['IDLE','DONE','REVIEW'].includes(w.stage) && !w.busy && !robotPending &&
+    status?.state === 'IDLE' && status.commissioned && status.simulator === w.simulated;
+  const limitsClear = idle && status.z_mode === 'fixed' && status.pos.z === 0 &&
+    ['z','j1','j2'].every(axis => status.limits?.[axis] === 1);
+  const homed = limitsClear && status.homed;
+  const hasBounds = ['j1','j2'].every(axis => Array.isArray(bounds?.[axis]) &&
+    bounds[axis].length === 2 && bounds[axis].every(Number.isInteger));
+  const canMove = homed && w.manual_enabled && hasBounds;
+  const nudge = status?.prehome_nudge;
+  const canNudge = limitsClear && !status.homed && w.manual_enabled &&
+    nudge?.enabled === true && nudge.step === 10 && nudge.remaining >= nudge.step;
+  let manualStatus;
+  if (!status) manualStatus = 'Waiting for the controller.';
+  else if (!status.commissioned) manualStatus = 'Status-only firmware: motion has not been commissioned.';
+  else if (['FAULT','ESTOP','HOLD'].includes(status.state) || ['FAULT','ESTOP'].includes(w.stage))
+    manualStatus = 'Resolve the cause, then Reset and Home.';
+  else if (w.busy || robotPending || status.state !== 'IDLE') manualStatus = 'Robot action in progress.';
+  else if (status.limits?.z !== 1) manualStatus = 'Z bottom limit is pressed or unavailable.';
+  else if (!status.homed && canNudge) manualStatus = 'Pre-home bench nudges: relative steps only.';
+  else if (!status.homed && nudge?.enabled && nudge.remaining < nudge.step)
+    manualStatus = 'Pre-home nudge budget exhausted. Do not power-cycle to continue nudging.';
+  else if (!status.homed && !limitsClear) manualStatus = 'Clear limit inputs are required for pre-home nudges.';
+  else if (!status.homed) manualStatus = 'Pre-home nudges are not enabled in firmware. Normal jogs require Home.';
+  else if (!w.manual_enabled) manualStatus = 'Jogging is not enabled in this launch mode.';
+  else if (!hasBounds) manualStatus = 'The controller is not reporting verified joint bounds.';
+  else if (!homed) manualStatus = 'A limit is pressed or fixed-Z status is unavailable.';
+  else manualStatus = 'Ready to jog one joint at a time.';
+  $('manual-state').textContent = manualStatus;
+  $('home-only').textContent = 'Home J1/J2';
+  $('home-only').disabled = !idle || status?.limits?.z !== 1;
+  $('manual-moves').hidden = !w.manual_enabled;
+  const virtualReady = !!virtual && !w.busy && !robotPending && ['IDLE','DONE','REVIEW'].includes(w.stage);
+  $('z-minus').disabled = !virtualReady || virtual.z_steps <= 0;
+  $('z-plus').disabled = !virtualReady || virtual.z_steps >= 100;
+  $('drill-toggle').disabled = !virtualReady;
+  $('drill-toggle').setAttribute('aria-pressed', !!virtual?.drill);
+  $('drill-toggle').textContent = `${virtual ? 'Virtual drill' : `Drill · GPIO ${status?.spindle_gpio ?? 23}`}: ${virtual?.drill ? 'On' : 'Off'}`;
+  $('tools-note').textContent = virtual
+    ? 'Virtual Z (steps) and drill only. Neither sends a command to a physical controller.'
+    : 'Hardware Z and drill are locked. The current firmware does not verify Z clearance or a drill interlock.';
+  $('jog-size').hidden = !status?.homed;
+  $('nudge-budget').textContent = status && !status.homed && nudge?.enabled
+    ? `${nudge.step} steps per nudge · ${nudge.remaining} steps remaining · No absolute position` : '';
+  $('save-park').disabled = !canMove;
+  $('return-park').disabled = !canMove || !w.park_configured;
+  $('pose-form').hidden = !w.pose_logging;
+  $('record-pose').disabled = !homed;
+  for (const button of document.querySelectorAll('[data-joint]')) {
+    const axis = button.dataset.joint;
+    const to = status?.pos[axis] + Number(button.dataset.sign) * Number($('jog-step').value);
+    button.disabled = !(canNudge || (canMove && to >= bounds[axis][0] && to <= bounds[axis][1]));
+  }
   const plan = new Map(w.plan.map(p => [p.id, p]));
   for (const tr of $('points').querySelectorAll('tr[data-id]')) {
     const p = plan.get(tr.dataset.id);
@@ -198,12 +434,13 @@ function controls() {
 }
 async function refresh() {
   try {
-    const res = await fetch('/api/state');
+    const res = await fetch(prefix+'/api/state');
     if (!res.ok) throw Error('Dashboard disconnected.');
     state = await res.json();
-    if (state.workflow && state.last && last?.id !== state.last.id) mode = 'result';
+    if (!onManualPage && !state.workflow?.manual_only &&
+        state.workflow && state.last && last?.id !== state.last.id) mode = 'result';
     result(state.last);
-    if (state.mode === 'replay') mode = 'result';
+    if (state.mode === 'replay' && state.demo_source !== 'demo') mode = 'result';
     if (!requesting && error === 'Dashboard disconnected.') error = '';
   } catch (_) { state = undefined; error = 'Dashboard disconnected.'; }
   controls();
@@ -213,7 +450,7 @@ async function measure() {
   if ($('scan').disabled) return;
   requesting = true; error = ''; controls();
   try {
-    const res = await fetch('/api/scan', {method:'POST'});
+    const res = await fetch(prefix+'/api/scan', {method:'POST'});
     const payload = await res.json();
     if (!res.ok) throw Error(payload.error || 'Scan failed.');
     result(payload); mode = 'result';
@@ -223,24 +460,79 @@ async function measure() {
 $('live').onclick = () => { mode = 'live'; image(); };
 $('result').onclick = () => { mode = 'result'; image(); };
 $('scan').onclick = measure;
-async function command(action) {
+async function command(action, data) {
   if (!action || (robotPending && action !== 'stop')) return;
   robotPending = true; error = ''; controls();
   try {
     const options = {method:'POST'};
-    if (action === 'execute') {
-      options.headers = {'Content-Type':'application/json'};
-      options.body = JSON.stringify({review_id:state.workflow.review_id});
+    if (action === 'execute') data = {review_id:state.workflow.review_id};
+    if (['jog','nudge','save-park','return-park','record-pose'].includes(action)) {
+      const status = state?.workflow?.status;
+      if (!status) throw Error('Wait for the live joint readout.');
+      data = {...data, boot:status.boot, command_id:status.command_id};
     }
-    const res = await fetch('/api/robot/'+action, options);
+    if (data) {
+      options.headers = {'Content-Type':'application/json'};
+      options.body = JSON.stringify(data);
+    }
+    const res = await fetch(prefix+'/api/robot/'+action, options);
     const payload = await res.json();
     if (!res.ok) throw Error(payload.error || 'Robot command failed.');
     if (state) state.workflow = payload;
+    if (action === 'source') location.reload();
   } catch (err) { error = err.message; }
   finally { robotPending = false; controls(); }
 }
 $('robot-action').onclick = () => command(robotAction);
 $('robot-stop').onclick = () => command('stop');
+$('z-minus').onclick = () => command('virtual-z', {delta:-10});
+$('z-plus').onclick = () => command('virtual-z', {delta:10});
+$('drill-toggle').onclick = () => command('virtual-drill', {on:!state?.workflow?.virtual_tools?.drill});
+$('source-select').onchange = event => command('source', {source:event.target.value});
+$('connect-form').onsubmit = async event => {
+  event.preventDefault();
+  const button = $('connect-form').querySelector('button');
+  button.disabled = true;
+  try {
+    const res = await fetch('/api/connect', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ip:$('controller-ip').value.trim(), token:$('controller-token').value})});
+    const payload = await res.json();
+    if (!res.ok) throw Error(payload.error || 'Connection failed.');
+    $('controller-token').value = '';
+    location.href = '/manual';
+  } catch (err) { error = err.message; controls(); }
+  finally { button.disabled = false; }
+};
+$('home-only').onclick = () => command('home');
+$('save-park').onclick = () => {
+  if (state?.workflow?.simulated || window.confirm('Is the camera view clear at this pose?')) {
+    command('save-park');
+  }
+};
+$('return-park').onclick = () => {
+  if (state?.workflow?.simulated || window.confirm('Is the full J1 then J2 path to park clear?')) {
+    command('return-park');
+  }
+};
+$('jog-step').onchange = controls;
+for (const button of document.querySelectorAll('[data-joint]')) {
+  button.onclick = () => {
+    const w = state?.workflow;
+    if (!w?.status) return;
+    const axis = button.dataset.joint, sign = Number(button.dataset.sign);
+    if (w.status.homed) {
+      command('jog', {axis, delta:sign * Number($('jog-step').value)});
+    } else if (w.simulated || window.confirm('Confirm the arm is in the marked test pose, the sweep is clear, and the hardwired stop is ready. Send one pre-home nudge?')) {
+      command('nudge', {axis, delta:sign * 10, clearance_confirmed:true});
+    }
+  };
+}
+$('pose-form').onsubmit = event => {
+  event.preventDefault();
+  const mm = id => $(id).value === '' ? null : $(id).valueAsNumber;
+  command('record-pose', {label:$('pose-label').value, role:$('pose-role').value,
+    x_mm:mm('pose-x'), y_mm:mm('pose-y')});
+};
 document.addEventListener('keydown', event => {
   if (!state?.workflow && event.key.toLowerCase() === 's' && !event.repeat && !event.metaKey && !event.ctrlKey && !event.altKey) measure();
 });

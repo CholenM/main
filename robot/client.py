@@ -66,11 +66,14 @@ class RobotClient:
             raise RobotError("Unsupported firmware/status or spindle not confirmed off.")
         return status
 
-    def motion(self, path, payload, cancelled, timeout=120, expected_boot=None):
+    def motion(self, path, payload, cancelled, timeout=120, expected_boot=None,
+               expected_command=None, observe=None):
         check_cancelled(cancelled)
         before = self.status()
         if expected_boot is not None and before["boot"] != expected_boot:
             raise RobotError("Controller restarted before motion.")
+        if expected_command is not None and before["command_id"] != expected_command:
+            raise RobotError("The controller command changed before motion.")
         check_cancelled(cancelled)
         ack = self.request(path, {**payload, "boot": before["boot"],
                                   "command_id": before["command_id"]})
@@ -82,6 +85,8 @@ class RobotClient:
         while time.monotonic() < until:
             check_cancelled(cancelled)
             status = self.status()
+            if observe is not None:
+                observe(status)
             if status["boot"] != boot:
                 raise RobotError("Controller restarted during motion.")
             if status["state"] in ("HOLD", "FAULT", "ESTOP"):
@@ -89,8 +94,14 @@ class RobotClient:
             if status["command_id"] != command:
                 raise RobotError("The active motion command changed.")
             if status["state"] == "IDLE":
-                if (not status["homed"] or (path == "move" and
-                        status["pos"][payload["axis"]] != payload["to"])):
+                if path == "nudge":
+                    axis = payload["axis"]
+                    reached = (not status["homed"] and
+                               status["pos"][axis] == before["pos"][axis] + payload["delta"])
+                else:
+                    reached = status["homed"] and (path != "move" or
+                              status["pos"][payload["axis"]] == payload["to"])
+                if not reached:
                     raise RobotError("Controller did not reach the requested datum/target.")
                 return status
             if status["state"] not in ("HOMING", "MOVING"):

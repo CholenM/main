@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 PRINT_DIR = ROOT / "Docs" / "print"
@@ -34,6 +35,24 @@ def marker(tag_id):
     if hasattr(aruco, "generateImageMarker"):
         return aruco.generateImageMarker(dictionary(), tag_id, 6)
     return aruco.drawMarker(dictionary(), tag_id, 6)
+
+
+def demo_frame():
+    """Synthetic camera input for the offline simulation; still goes through CV."""
+    scale = 6
+    frame = np.full((PAGE[1] * scale, PAGE[0] * scale, 3), 255, dtype=np.uint8)
+
+    def pixel(x, y):
+        return round((PAGE_OFFSET[0] + x) * scale), round((PAGE[1] - PAGE_OFFSET[1] - y) * scale)
+
+    for tag_id in TAGS:
+        x, y = pixel(*tag_corners(tag_id)[0])
+        side = TAG_SIZE * scale
+        tag = cv2.resize(marker(tag_id), (side, side), interpolation=cv2.INTER_NEAREST)
+        frame[y:y+side, x:x+side] = cv2.cvtColor(tag, cv2.COLOR_GRAY2BGR)
+    for _, x, y, diameter in POINTS:
+        cv2.circle(frame, pixel(x, y), round(scale * diameter / 2), (0, 0, 0), -1, cv2.LINE_AA)
+    return frame
 
 
 def generate(output=PRINT_DIR):

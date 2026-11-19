@@ -1,18 +1,27 @@
 """Protocol and integrated workflow tests without physical motion."""
 
+import csv
+import json
 import tempfile
 import time
 import unittest
 from argparse import Namespace
+from functools import partial
+from http.server import ThreadingHTTPServer
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+import numpy as np
 
 from robot.client import RobotClient, RobotError
 from robot.planner import Planner
 from robot.sim import Controller, server
 from robot.workflow import Workflow
-from vision.dashboard import Session
+from vision import fixture
+from vision.dashboard import Dashboard, Session
 
 
 class RobotTest(unittest.TestCase):
@@ -27,8 +36,9 @@ class RobotTest(unittest.TestCase):
             self.assertEqual(finish["pos"]["j1"], 100)
             with self.assertRaisesRegex(RobotError, "SPINDLE_DISABLED"):
                 client.request("spindle", {"on": True})
-            with self.assertRaisesRegex(RobotError, "INVALID_TARGET"):
-                client.motion("move", {"axis": "z", "to": -1, "feed": 2000}, Event())
+            for to in (-1, 0):
+                with self.assertRaisesRegex(RobotError, "Z_FIXED"):
+                    client.motion("move", {"axis": "z", "to": to, "feed": 2000}, Event())
             client.request("estop", {})
             self.assertEqual(client.status()["state"], "ESTOP")
             with self.assertRaises(RobotError):
@@ -109,6 +119,256 @@ class RobotTest(unittest.TestCase):
             self.assertEqual(workflow.describe()["stage"], "ESTOP")
             self.assertEqual(client.status()["state"], "ESTOP")
             self.assertFalse(client.status()["homed"])
+
+    def test_manual_setup_guards_and_mode_b(self):
+        with server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), object())
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True)
+
+            def jog(axis, delta, status=None):
+                workflow.launch("jog", data=dict(status or client.status(), axis=axis, delta=delta))
+
+            with self.assertRaisesRegex(RobotError, "idle and homed"):
+                jog("j1", 10)
+            workflow.launch("home")
+            workflow.worker.join(5)
+            initial = client.status()
+            for axis, delta in (("z", 10), ("j1", 1000), ("j2", True)):
+                with self.assertRaisesRegex(RobotError, "allowed jog"):
+                    jog(axis, delta)
+            jog("j1", 25)
+            workflow.worker.join(5)
+            self.assertEqual(client.status()["pos"]["j1"], 25)
+            with self.assertRaisesRegex(RobotError, "stale"):
+                jog("j1", 10, initial)
+            workflow.launch("save-park", data=client.status())
+            jog("j2", -10)
+            workflow.worker.join(5)
+            workflow.launch("return-park", data=client.status())
+            workflow.worker.join(5)
+            self.assertEqual(client.status()["pos"], {"z": 0, "j1": 25, "j2": 0})
+            client.motion("move", {"axis": "j1", "to": 10000, "feed": 2000}, Event())
+            with self.assertRaisesRegex(RobotError, "outside"):
+                jog("j1", 10)
+            self.assertEqual(client.status()["pos"]["j1"], 10000)
+
+            result = {"id": "scan1", "passed": True, "expected": 1, "points": []}
+            with patch.object(session, "measure", return_value=result):
+                workflow.launch("start")
+                workflow.worker.join(5)
+            self.assertEqual(workflow.stage, "REVIEW")
+            self.assertFalse(workflow.describe()["can_execute"])
+            self.assertIn("Coordinates only", workflow.message)
+            jog("j2", 10)
+            workflow.worker.join(5)
+            self.assertIsNone(workflow.describe()["review_id"])
+
+    def test_record_uses_live_steps_and_exports_csv(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            path = Path(temp) / "poses.jsonl"
+            workflow = Workflow(client, session, simulated=True, pose_log=path)
+            workflow.launch("home")
+            workflow.worker.join(5)
+            status = client.status()
+            with self.assertRaisesRegex(RobotError, "both measured"):
+                workflow.launch("record-pose", data=dict(status, role="fit", x_mm=5))
+            self.assertFalse(path.exists())
+            workflow.launch("record-pose", data=dict(status, label="=Sample", role="check",
+                                                     x_mm=0, y_mm=15, j1_steps=999))
+            recorded = json.loads(path.read_text())
+            exported = next(csv.DictReader(workflow.pose_csv().splitlines()))
+            self.assertEqual((recorded["boot"], recorded["j1_steps"], recorded["y_mm"]),
+                             (status["boot"], 0, 15))
+            self.assertEqual((exported["label"], exported["role"]), ("'=Sample", "check"))
+
+    def test_manual_jog_refused_while_workflow_active(self):
+        with server(controller=Controller(move_seconds=.5)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True)
+            workflow.launch("home")
+            with self.assertRaisesRegex(RobotError, "still finishing"):
+                workflow.launch("jog", data={"axis": "j1", "delta": 10})
+            workflow.stop()
+            workflow.worker.join(5)
+
+    def test_manual_only_jogs_without_camera_or_park(self):
+        with server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True, manual_only=True)
+            self.assertFalse(session.state()["ready"])
+            self.assertFalse(workflow.describe()["park_configured"])
+            for action in ("start", "execute"):
+                with self.assertRaisesRegex(RobotError, "manual-only"):
+                    workflow.launch(action)
+            with self.assertRaisesRegex(RobotError, "idle and homed"):
+                workflow.launch("jog", data={"axis": "j2", "delta": 10})
+            workflow.launch("home")
+            workflow.worker.join(5)
+            workflow.launch("jog", data=dict(client.status(), axis="j2", delta=10))
+            workflow.worker.join(5)
+            self.assertEqual(client.status()["pos"]["j2"], 10)
+            self.assertFalse(workflow.describe()["can_execute"])
+
+    def test_prehome_nudges_are_limited_and_do_not_establish_home(self):
+        with server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            client = RobotClient(url, token)
+            workflow = Workflow(client, session, simulated=True, manual_only=True)
+
+            def nudge(axis, delta, confirmed=True):
+                workflow.launch("nudge", data=dict(client.status(), axis=axis, delta=delta,
+                                                   clearance_confirmed=confirmed))
+                workflow.worker.join(5)
+
+            with self.assertRaisesRegex(RobotError, "Confirm physical clearance"):
+                nudge("j2", 10, False)
+            for axis, delta in (("z", 10), ("j2", 25)):
+                with self.assertRaisesRegex(RobotError, "allowed jog"):
+                    nudge(axis, delta)
+            nudge("j2", -10)
+            self.assertEqual(client.status()["pos"]["j2"], -10)
+            self.assertFalse(client.status()["homed"])
+            client.request("estop", {})
+            client.request("reset", {})
+            self.assertEqual(client.status()["prehome_nudge"]["remaining"], 20)
+            nudge("j1", 10)
+            nudge("j1", -10)
+            with self.assertRaisesRegex(RobotError, "budget"):
+                nudge("j2", 10)
+            with self.assertRaisesRegex(RobotError, "NUDGE_BUDGET_EXHAUSTED"):
+                client.motion("nudge", {"axis": "j1", "delta": 10, "clearance_confirmed": True}, Event())
+
+    def test_dashboard_manual_actions_and_pose_download(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                server(controller=Controller(move_seconds=.02)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            session.workflow = Workflow(RobotClient(url, token), session, simulated=True,
+                                        pose_log=Path(temp) / "poses.jsonl")
+            with ThreadingHTTPServer(("127.0.0.1", 0), partial(Dashboard, session=session)) as app:
+                thread = Thread(target=app.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{app.server_port}/api/"
+
+                def post(action, data=None):
+                    body = json.dumps(data).encode() if data is not None else None
+                    request = Request(base + "robot/" + action, body,
+                                      {"Content-Type": "application/json"}, method="POST")
+                    with urlopen(request, timeout=3) as response:
+                        return json.load(response)
+
+                def status():
+                    with urlopen(base + "state", timeout=3) as response:
+                        return json.load(response)["workflow"]["status"]
+
+                try:
+                    with urlopen(base.removesuffix("api/") + "manual", timeout=3) as response:
+                        page = response.read()
+                        self.assertIn(b'id="manual-panel"', page)
+                        self.assertIn(b'id="camera-panel"', page)
+                    with self.assertRaises(HTTPError) as caught:
+                        post("jog", [])
+                    self.assertEqual(caught.exception.code, 400)
+                    with patch.object(session, "diagnostic_frame",
+                                      return_value=np.zeros((24, 32, 3), dtype=np.uint8)):
+                        post("home")
+                        session.workflow.worker.join(5)
+                    trace = session.workflow.describe()["home_trace"]
+                    self.assertEqual(trace["outcome"], "homed")
+                    trace_url = base.removesuffix("api/") + f"homing/{trace['id']}/"
+                    with urlopen(trace_url + "trace.csv", timeout=3) as response:
+                        samples = list(csv.DictReader(response.read().decode().splitlines()))
+                    self.assertEqual(samples[0]["sample"], "before")
+                    self.assertEqual(samples[-1]["homed"], "True")
+                    with urlopen(trace_url + "after.jpg", timeout=3) as response:
+                        self.assertEqual(response.headers.get_content_type(), "image/jpeg")
+                    post("jog", dict(status(), axis="j2", delta=10))
+                    session.workflow.worker.join(5)
+                    post("record-pose", dict(status(), label="Sample"))
+                    with urlopen(base + "robot/poses.csv", timeout=3) as response:
+                        row = next(csv.DictReader(response.read().decode().splitlines()))
+                    self.assertEqual((row["label"], row["j2_steps"]), ("Sample", "10"))
+                finally:
+                    app.shutdown()
+                    thread.join()
+
+    def test_homing_fault_trace_survives_reset(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                server(controller=Controller(move_seconds=1, lease_seconds=0)) as (url, token):
+            session = Session(Namespace(verify=False), None)
+            path = Path(temp) / "poses.jsonl"
+            workflow = Workflow(RobotClient(url, token), session, simulated=True, pose_log=path)
+            workflow.launch("home")
+            workflow.worker.join(5)
+            self.assertEqual(workflow.stage, "FAULT")
+            summary = workflow.describe()["home_trace"]
+            self.assertEqual(summary["outcome"], "failed")
+            self.assertIn("HEARTBEAT", summary["error"])
+            with (path.parent / "homing" / summary["id"] / "trace.csv").open() as file:
+                self.assertEqual(list(csv.DictReader(file))[-1]["fault"], "HEARTBEAT")
+            self.assertNotIn("after.jpg", summary["files"])
+            workflow.launch("reset")
+            workflow.worker.join(5)
+            self.assertEqual(workflow.describe()["home_trace"], summary)
+
+    def test_console_simulation_scans_image_and_reports_confirmed_visits(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                server(controller=Controller(move_seconds=.02)) as (url, token):
+            args = Namespace(verify=False, replay=None, runs_dir=Path(temp), preset="paper",
+                             reference=None, polarity="dark", min_diameter=2.2, max_diameter=4)
+            live = Session(args, None)
+            simulated = Session(args, fixture.demo_frame(), demo=True)
+            simulated.workflow = Workflow(RobotClient(url, token), simulated, Planner.load(None, True),
+                                           park={"j1": 0, "j2": 0}, simulated=True)
+            handler = partial(Dashboard, session=live, simulation=simulated)
+            with ThreadingHTTPServer(("127.0.0.1", 0), handler) as app:
+                thread = Thread(target=app.serve_forever, daemon=True)
+                thread.start()
+                base = f"http://127.0.0.1:{app.server_port}"
+
+                def load(path):
+                    with urlopen(base + path, timeout=5) as response:
+                        return json.load(response)
+
+                def act(action, data=None):
+                    body = json.dumps(data).encode() if data is not None else None
+                    request = Request(base + "/sim/api/robot/" + action, body,
+                                      {"Content-Type": "application/json"}, method="POST")
+                    with urlopen(request, timeout=5) as response:
+                        return json.load(response)
+
+                try:
+                    self.assertTrue(load("/api/state")["has_simulation"])
+                    self.assertIsNone(load("/api/state")["workflow"])
+                    self.assertEqual(load("/sim/api/state")["demo_source"], "demo")
+                    self.assertEqual(act("virtual-z", {"delta": 10})["virtual_tools"]["z_steps"], 10)
+                    self.assertTrue(act("virtual-drill", {"on": True})["virtual_tools"]["drill"])
+                    act("start")
+                    simulated.workflow.worker.join(10)
+                    review = load("/sim/api/state")["workflow"]
+                    self.assertEqual(review["stage"], "REVIEW", review)
+                    self.assertFalse(review["virtual_tools"]["drill"])
+                    act("execute", {"review_id": review["review_id"]})
+                    simulated.workflow.worker.join(10)
+                    complete = load("/sim/api/state")["workflow"]
+                    self.assertEqual(complete["stage"], "DONE", complete)
+                    proof = load("/sim" + complete["dry_run_url"])
+                    self.assertTrue(proof["simulated"])
+                    self.assertEqual(len(proof["points"]), 6)
+                    for point in proof["points"]:
+                        self.assertEqual(point["state"], "visited")
+                        self.assertEqual(point["steps"], point["confirmed_steps"])
+                        self.assertEqual(point["achievable_mm"], point["confirmed_xy_mm"])
+                        self.assertGreater(point["command_id"], 0)
+                    self.assertIsNone(load("/api/state")["workflow"])
+                finally:
+                    app.shutdown()
+                    thread.join()
 
 
 if __name__ == "__main__":

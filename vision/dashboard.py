@@ -4,6 +4,7 @@ import csv
 import json
 import mimetypes
 import time
+from copy import copy
 from http.server import BaseHTTPRequestHandler
 from threading import Condition, Event, Lock, Thread
 from urllib.parse import urlsplit
@@ -12,6 +13,7 @@ import cv2
 
 from . import fixture, scan
 from robot.client import RobotError
+from robot.home_trace import MIME as HOME_TRACE_MIME
 
 FILES = ("raw.png", "rectified.png", "overlay.png", "report.md", "detections.csv",
          "errors.csv", "ground_truth.csv", "registration.json", "job.json")
@@ -85,13 +87,31 @@ class LiveCamera:
 
 
 class Session:
-    def __init__(self, args, replay):
+    def __init__(self, args, replay, demo=False):
         self.args = args
         self.replay = replay
         self.camera = None
         self.guard = Lock()
         self.last = None
         self.workflow = None
+        self.demo_frame = replay if demo else None
+        self.connector = None
+
+    def connect(self, data):
+        if self.connector is None:
+            raise RobotError("Hardware setup is not available on this page.")
+        with self.guard:
+            if self.workflow is not None:
+                raise RobotError("A controller is already connected for this dashboard session.")
+            self.workflow = self.connector(data)
+
+    def diagnostic_frame(self):
+        if self.camera is not None:
+            try:
+                return self.camera.snapshot()
+            except scan.ScanError:
+                pass
+        return None
 
     def state(self):
         camera = self.camera
@@ -99,6 +119,9 @@ class Session:
                 "ready": self.replay is not None or bool(camera and camera.frame is not None and not camera.error),
                 "camera_error": camera.error if camera else None, "busy": self.guard.locked(),
                 "verify": self.args.verify,
+                "can_connect": self.connector is not None and self.workflow is None,
+                "demo_source": ("demo" if self.replay is not None else "live")
+                if self.demo_frame is not None else None,
                 "last": self.last[1] if self.last else None,
                 "workflow": self.workflow.describe() if self.workflow else None}
 
@@ -106,8 +129,14 @@ class Session:
         if not self.guard.acquire(blocking=False):
             raise BlockingIOError("A scan is already running.")
         try:
+            if self.replay is None and self.camera is None:
+                raise scan.ScanError("No live camera is available.")
             frame = self.replay if self.replay is not None else self.camera.snapshot()
-            directory, passed = scan.run(self.args, frame)
+            options = self.args
+            if self.replay is self.demo_frame and self.demo_frame is not None:
+                options = copy(self.args)
+                options.replay = "built-in fixture"
+            directory, passed = scan.run(options, frame)
 
             def rows(name):
                 path = directory / name
@@ -135,9 +164,18 @@ class Session:
 
 
 class Dashboard(BaseHTTPRequestHandler):
-    def __init__(self, *args, session, **kwargs):
-        self.session = session
+    def __init__(self, *args, session, simulation=None, **kwargs):
+        self.primary, self.simulation = session, simulation
+        self.session = self.primary
         super().__init__(*args, **kwargs)
+
+    def select_view(self):
+        path = urlsplit(self.path).path
+        self.session = self.primary
+        if self.simulation and (path == "/sim" or path.startswith("/sim/")):
+            self.session = self.simulation
+            return path.removeprefix("/sim") or "/"
+        return path
 
     def log_request(self, code="-", size="-"):
         if urlsplit(self.path).path != "/api/state":
@@ -155,24 +193,77 @@ class Dashboard(BaseHTTPRequestHandler):
     def json(self, data, status=200):
         self.send_data(json.dumps(data).encode(), "application/json", status)
 
+    def robot_body(self):
+        if self.headers.get_content_type() != "application/json":
+            raise ValueError
+        size = int(self.headers.get("Content-Length", "0"))
+        if not 1 <= size <= 1024:
+            raise ValueError
+        data = json.loads(self.rfile.read(size))
+        if not isinstance(data, dict):
+            raise ValueError
+        return data
+
+    def physical_host_allowed(self):
+        port = self.server.server_port
+        return self.headers.get("Host") in (f"localhost:{port}", f"127.0.0.1:{port}")
+
     def do_GET(self):
-        path = urlsplit(self.path).path
-        if path == "/":
+        path = self.select_view()
+        if path == "/" or (path == "/manual" and (self.session.workflow or self.session.connector)):
             self.send_data((fixture.ROOT / "vision" / "dashboard.html").read_bytes(),
                            "text/html; charset=utf-8")
         elif path == "/api/state":
             if self.session.workflow:
                 self.session.workflow.poll()
-            self.json(self.session.state())
+            self.json(self.session.state() | {"has_simulation": self.simulation is not None})
+        elif path == "/api/robot/poses.csv" and self.session.workflow:
+            workflow = self.session.workflow
+            if not workflow.simulated and not self.physical_host_allowed():
+                self.json({"error": "Physical workflow is available only through loopback."}, 403)
+                return
+            try:
+                data = workflow.pose_csv()
+            except (OSError, ValueError, RobotError):
+                self.json({"error": "The pose log could not be exported."}, 500)
+            else:
+                self.send_data(data.encode(), "text/csv; charset=utf-8")
+        elif path.startswith("/homing/") and self.session.workflow:
+            workflow = self.session.workflow
+            if not workflow.simulated and not self.physical_host_allowed():
+                self.json({"error": "Physical workflow is available only through loopback."}, 403)
+                return
+            with workflow.condition:
+                bundle = workflow.home_trace
+            if bundle:
+                directory, summary = bundle
+                filename = path.rsplit("/", 1)[-1]
+                if filename in summary["files"] and path == f"/homing/{summary['id']}/{filename}":
+                    try:
+                        data = (directory / filename).read_bytes()
+                    except OSError:
+                        self.send_error(404)
+                    else:
+                        self.send_data(data, HOME_TRACE_MIME[filename])
+                    return
+            self.send_error(404)
         elif path == "/stream.mjpg" and self.session.camera:
             self.stream(self.session.camera)
+        elif path == "/demo.jpg" and self.session.demo_frame is not None:
+            ok, image = cv2.imencode(".jpg", self.session.demo_frame)
+            if ok:
+                self.send_data(image.tobytes(), "image/jpeg")
+            else:
+                self.send_error(503)
         elif path.startswith("/run/"):
             workflow = self.session.workflow
             if workflow:
                 with workflow.condition:
                     directory = workflow.directory
-                if directory and path == f"/run/{directory.name}/plan.json":
-                    plan = directory / "plan.json"
+                filename = path.rsplit("/", 1)[-1]
+                if (directory and filename in ("plan.json", "dry_run.json")
+                        and path == f"/run/{directory.name}/{filename}"):
+                    plan = directory / filename
                     if plan.is_file():
                         self.send_data(plan.read_bytes(), "application/json")
                         return
@@ -210,35 +301,36 @@ class Dashboard(BaseHTTPRequestHandler):
             pass  # Browser switched views or disconnected.
 
     def do_POST(self):
+        path = self.select_view()
         workflow = self.session.workflow
-        if self.path != "/api/scan" and not (workflow and self.path.startswith("/api/robot/")):
+        if path not in ("/api/scan", "/api/connect") and not (workflow and path.startswith("/api/robot/")):
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
-        if workflow and not workflow.simulated:
-            port = self.server.server_port
-            hosts = {f"localhost:{port}", f"127.0.0.1:{port}"}
-            if self.headers.get("Host") not in hosts:
-                self.json({"error": "Physical workflow is available only through loopback."}, 403)
-                return
+        if (path == "/api/connect" or workflow and not workflow.simulated) and not self.physical_host_allowed():
+            self.json({"error": "Physical workflow is available only through loopback."}, 403)
+            return
         if origin and urlsplit(origin).netloc != self.headers.get("Host"):
             self.json({"error": "Cross-origin scan requests are not allowed."}, 403)
             return
         try:
-            if self.path.startswith("/api/robot/"):
-                action = self.path.removeprefix("/api/robot/")
+            if path == "/api/connect":
+                self.session.connect(self.robot_body())
+                result = {"connected": True}
+            elif path.startswith("/api/robot/"):
+                action = path.removeprefix("/api/robot/")
                 if action == "stop":
                     workflow.stop()
-                elif action == "execute":
+                elif action in ("execute", "jog", "nudge", "record-pose", "save-park", "return-park",
+                                "virtual-z", "virtual-drill", "source"):
                     try:
-                        size = int(self.headers.get("Content-Length", "0"))
-                        if not 1 <= size <= 256:
+                        data = self.robot_body()
+                        if action == "execute" and not isinstance(data["review_id"], str):
                             raise ValueError
-                        review_id = json.loads(self.rfile.read(size))["review_id"]
                     except (ValueError, TypeError, KeyError):
-                        self.json({"error": "Provide the current review_id."}, 400)
+                        self.json({"error": "Invalid JSON for this robot action."}, 400)
                         return
-                    workflow.launch(action, review_id)
+                    workflow.launch(action, data.get("review_id"), data)
                 else:
                     workflow.launch(action)
                 result = workflow.describe()
@@ -254,5 +346,7 @@ class Dashboard(BaseHTTPRequestHandler):
             self.json({"error": str(exc)}, 409)
         except OSError as exc:
             self.json({"error": str(exc)}, 500)
+        except (TypeError, ValueError, KeyError):
+            self.json({"error": "Invalid request body."}, 400)
         else:
             self.json(result)

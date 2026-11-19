@@ -26,6 +26,11 @@ struct Axis {
 #include "machine_config.example.h"
 #endif
 
+#ifndef SCARA_ENABLE_PREHOME_NUDGE
+#define SCARA_ENABLE_PREHOME_NUDGE 0
+#endif
+constexpr int32_t NUDGE_STEPS = 10, NUDGE_BUDGET = 30;
+
 enum State { IDLE, HOMING, MOVING, HOLD, FAULT, ESTOP };
 enum HomePhase { SEEK, RELEASE, LATCH, BACKOFF };
 constexpr uint32_t LEASE_MS = 2000;
@@ -43,6 +48,8 @@ struct Motion {
   int32_t pos[3] = {}, target[3] = {}, remaining = 0;
   uint32_t command = 0, lease = 0, nextEdge = 0, feed = HOME_FEED_US, changedAt = 0;
   HomePhase phase = SEEK;
+  bool homeFault = false;
+  int32_t nudgeSpent = 0;
   const char* fault = nullptr;
 };
 
@@ -59,6 +66,7 @@ uint32_t lastLinkReport = 0, lastStatusChange = 0;
 
 // Keep Arduino's sketch preprocessor from generating prototypes before these enum types.
 const char* stateName(State state);
+const char* phaseName(HomePhase phase);
 const char* netName(wl_status_t status);
 void halt(State state, const char* fault);
 void homePhase(HomePhase phase);
@@ -74,6 +82,16 @@ const char* stateName(State state) {
     case ESTOP: return "ESTOP";
   }
   return "FAULT";
+}
+
+const char* phaseName(HomePhase phase) {
+  switch (phase) {
+    case SEEK: return "SEEK";
+    case RELEASE: return "RELEASE";
+    case LATCH: return "LATCH";
+    case BACKOFF: return "BACKOFF";
+  }
+  return nullptr;
 }
 
 const char* netName(wl_status_t status) {
@@ -110,6 +128,7 @@ bool triggered(int axis) { return digitalRead(AXES[axis].limitPin) == LOW; }
 
 // All functions below that mutate motion run under motionLock.
 void halt(State state, const char* fault) {
+  motion.homeFault = state == FAULT && motion.state == HOMING;
   for (int i = 0; i < 3; ++i) {
     digitalWrite(AXES[i].stepPin, LOW);
     motion.target[i] = motion.pos[i];
@@ -222,7 +241,14 @@ void tick(bool connected) {
       else { motion.state = IDLE; motion.homed = true; }
       return;
     }
-    if (motion.remaining == 0) { halt(FAULT, "HOME_TIMEOUT"); return; }
+    if (motion.remaining == 0) {
+      static const char* const timeouts[][3] = {
+        {"HOME_TIMEOUT_J1_SEEK", "HOME_TIMEOUT_J1_RELEASE", "HOME_TIMEOUT_J1_LATCH"},
+        {"HOME_TIMEOUT_J2_SEEK", "HOME_TIMEOUT_J2_RELEASE", "HOME_TIMEOUT_J2_LATCH"},
+      };
+      halt(FAULT, timeouts[i - J1][motion.phase]);
+      return;
+    }
     --motion.remaining;
   }
   digitalWrite(AXES[i].stepPin, HIGH);
@@ -272,10 +298,21 @@ void status() {
   doc["state"] = stateName(current.state);
   doc["homed"] = current.homed;
   doc["spindle"] = false;
+  doc["spindle_gpio"] = SPINDLE_PIN;
   doc["z_mode"] = "fixed";
   doc["commissioned"] = profileValid && motionTaskReady;
+  doc["prehome_nudge"]["enabled"] = bool(SCARA_ENABLE_PREHOME_NUDGE) && profileValid && motionTaskReady;
+  doc["prehome_nudge"]["step"] = NUDGE_STEPS;
+  doc["prehome_nudge"]["remaining"] = NUDGE_BUDGET - current.nudgeSpent;
   doc["simulator"] = false;
   doc["fault"] = current.fault;
+  if (current.state == HOMING || current.homeFault) {
+    doc["home_axis"] = AXES[current.axis].label;
+    doc["home_phase"] = phaseName(current.phase);
+  } else {
+    doc["home_axis"] = nullptr;
+    doc["home_phase"] = nullptr;
+  }
   doc["rssi"] = WiFi.RSSI();
   doc["ip"] = WiFi.localIP().toString();
   for (int i = 0; i < 3; ++i) {
@@ -283,6 +320,8 @@ void status() {
     doc["pos"][name] = current.pos[i];
     doc["target"][name] = current.target[i];
     doc["limits"][name] = triggered(i) ? 0 : 1;
+    doc["bounds"][name][0] = AXES[i].minSteps;
+    doc["bounds"][name][1] = AXES[i].maxSteps;
   }
   reply(200, doc);
 }
@@ -302,6 +341,11 @@ void command() {
     if (strcmp(label, AXES[i].label) == 0) axis = i;
   int32_t target = input["to"].as<int32_t>();
   uint32_t feed = input["feed"].as<uint32_t>();
+  const bool nudge = path == "/nudge";
+  const int32_t delta = input["delta"].as<int32_t>();
+  const bool validNudge = (axis == J1 || axis == J2) && input["delta"].is<int32_t>() &&
+      (delta == NUDGE_STEPS || delta == -NUDGE_STEPS) &&
+      input["clearance_confirmed"].is<bool>() && input["clearance_confirmed"].as<bool>();
   const bool validMove = (axis == J1 || axis == J2) && input["to"].is<int32_t>() &&
       input["feed"].is<uint32_t>() && feed >= MIN_FEED_US && feed <= MAX_FEED_US &&
       target >= AXES[axis].minSteps && target <= AXES[axis].maxSteps;
@@ -327,16 +371,30 @@ void command() {
   } else if (path == "/spindle" && input["on"].is<bool>()) {
     digitalWrite(SPINDLE_PIN, LOW);
     if (input["on"].as<bool>()) error = "SPINDLE_DISABLED";
-  } else if ((path == "/home" || path == "/move") && motion.state == IDLE) {
+  } else if ((path == "/home" || path == "/move" || nudge) && motion.state == IDLE) {
     if (!profileValid || !motionTaskReady) error = "NOT_COMMISSIONED";
     else if (!validHeartbeat || !matchingBoot || motion.command != expected) error = "COMMAND_CHANGED";
-    else if (path == "/move" && axis == Z) { error = "Z_FIXED"; code = 400; }
+    else if ((path == "/move" || nudge) && axis == Z) { error = "Z_FIXED"; code = 400; }
     else if (triggered(Z)) error = "Z_BOTTOM_LIMIT";
     else if (path == "/home") {
       motion.state = HOMING;
       motion.homed = false;
       startHomeAxis(J1);
       code = 202;
+    } else if (nudge) {
+      if (!SCARA_ENABLE_PREHOME_NUDGE) error = "PREHOME_NUDGE_DISABLED";
+      else if (!validNudge) { error = "INVALID_NUDGE_OR_CLEARANCE"; code = 400; }
+      else if (motion.homed) error = "ALREADY_HOMED";
+      else if (motion.nudgeSpent + NUDGE_STEPS > NUDGE_BUDGET) error = "NUDGE_BUDGET_EXHAUSTED";
+      else if (triggered(J1) || triggered(J2)) error = "JOINT_LIMIT_ACTIVE";
+      else {
+        motion.nudgeSpent += NUDGE_STEPS;
+        motion.axis = axis;
+        motion.target[axis] = motion.pos[axis] + delta;
+        motion.state = MOVING;
+        direction(delta > 0 ? 1 : -1, LATCH_FEED_US);
+        code = 202;
+      }
     } else if (!validMove) { error = "INVALID_TARGET_OR_FEED"; code = 400; }
     else if (!motion.homed) error = "NOT_HOMED";
     else if (triggered(J1) || triggered(J2)) error = "JOINT_LIMIT_ACTIVE";
@@ -393,7 +451,7 @@ void setup() {
   static const char* headers[] = {"X-SCARA-Token"};
   server.collectHeaders(headers, 1);
   server.on("/status", HTTP_GET, status);
-  const char* commands[] = {"/home", "/move", "/heartbeat", "/stop", "/estop", "/reset", "/spindle"};
+  const char* commands[] = {"/home", "/move", "/nudge", "/heartbeat", "/stop", "/estop", "/reset", "/spindle"};
   for (const char* path : commands) server.on(path, HTTP_POST, command);
   server.onNotFound([]() { failure(404, "UNKNOWN_ENDPOINT"); });
   WiFi.mode(WIFI_STA);

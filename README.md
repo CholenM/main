@@ -82,12 +82,22 @@ inconsistent registration reject the scan rather than exporting a job.
 
 ## Robot workflow
 
-Run `./start.sh --serve --simulate-robot` to try **Start → Home → Park → Scan →
-Review → Approve dry run → Verify** with the local controller simulator. Add
-`--replay <image-or-run>` for an offline demonstration. Standard `--serve` remains
-vision-only. For the physical ESP32, see the [controller contract and commissioning
-guide](Docs/robot-contract.md). The sketch ships status-only until the limit and
-travel profile is verified; the workflow never enables the spindle.
+Run **`./start.sh`** and open `http://localhost:8080/`. Connect the ESP32 in
+the UI or select **Run simulation** to scan an image and verify simulated
+target visits without hardware. See the [command guide](Docs/command-guide.md).
+
+Run `./start.sh --serve --simulate-robot` to try **Homing → Scanning → Planning →
+Executing → Done** with the local controller simulator. Approve the plan before
+execution. Add `--replay <image-or-run>` for an offline demonstration.
+Standard `--serve` remains vision-only. For physical Mode B (home, park, scan
+and show coordinates) and the manual setup and pose logging tools, see the
+[controller contract and commissioning guide](Docs/robot-contract.md).
+The sketch ships status-only until the travel profile is verified; the workflow
+never enables the spindle.
+
+For separate J1/J2 control with live camera preview, open `/manual` on the
+robot dashboard. See the [command guide](Docs/command-guide.md) for launch
+commands and pre-home bench testing.
 
 Run `python3 -m unittest discover -s tests -v` to regression-test the nominal print
 and inspection path from rasterized PDFs (`pdftoppm`, from `poppler-utils`, is required

@@ -1,5 +1,8 @@
 #pragma once
 
+// Opt in only after verifying pre-home test poses and the hardwired stop.
+#define SCARA_ENABLE_PREHOME_NUDGE 0
+
 // Status-only by default. Copy to machine_config.h for commissioning.
 // Z is mechanically fixed; its home sign and all motion fields must remain zero.
 // For J1/J2 measure positiveLevel (CCW viewed from above), homeSign (+/-1),

@@ -12,6 +12,8 @@ from threading import Lock, Thread
 
 from .client import AXES, VERSION
 
+BOUNDS = {"z": (0, 0), "j1": (-10000, 10000), "j2": (-10000, 10000)}
+
 
 class Controller:
     def __init__(self, move_seconds=0.20, lease_seconds=2.0):
@@ -22,6 +24,7 @@ class Controller:
         self.target = self.pos.copy()
         self.state, self.homed, self.fault = "IDLE", False, None
         self.finish = self.lease = 0
+        self.nudge_remaining = 30
         self.move_seconds, self.lease_seconds = move_seconds, lease_seconds
 
     def handle(self, path, body=None):
@@ -32,13 +35,19 @@ class Controller:
                     self.halt("FAULT", "HEARTBEAT")
                 elif self.finish <= now:
                     self.pos = self.target.copy()
-                    self.state, self.homed = "IDLE", True
+                    if self.state == "HOMING":
+                        self.homed = True
+                    self.state = "IDLE"
             if path == "/status" and body is None:
                 return 200, {"fw": VERSION, "boot": self.boot, "command_id": self.command,
                              "state": self.state, "homed": self.homed, "pos": self.pos.copy(),
                              "target": self.target.copy(), "limits": dict.fromkeys(AXES, 1),
                              "spindle": False, "fault": self.fault, "commissioned": True,
-                             "simulator": True}
+                              "simulator": True, "z_mode": "fixed", "bounds": BOUNDS,
+                              "prehome_nudge": {"enabled": True, "step": 10,
+                                                "remaining": self.nudge_remaining},
+                              "home_axis": "j1" if self.state == "HOMING" else None,
+                              "home_phase": "SEEK" if self.state == "HOMING" else None}
             if body is None:
                 return 404, {"error": "UNKNOWN_ENDPOINT"}
             if path == "/heartbeat":
@@ -58,17 +67,33 @@ class Controller:
             if path == "/reset" and self.state in ("HOLD", "FAULT", "ESTOP"):
                 self.halt("IDLE", None)
                 return 200, self.ack()
-            if path in ("/home", "/move") and self.state == "IDLE":
+            if path in ("/home", "/move", "/nudge") and self.state == "IDLE":
                 if (body.get("boot"), body.get("command_id")) != (self.boot, self.command):
                     return 409, {"error": "COMMAND_CHANGED"}
                 if path == "/home":
                     self.state, self.homed = "HOMING", False
                     self.target = dict.fromkeys(AXES, 0)
+                elif path == "/nudge":
+                    axis, delta = body.get("axis"), body.get("delta")
+                    if axis == "z":
+                        return 400, {"error": "Z_FIXED"}
+                    if (axis not in ("j1", "j2") or type(delta) is not int or
+                            abs(delta) != 10 or body.get("clearance_confirmed") is not True):
+                        return 400, {"error": "INVALID_NUDGE_OR_CLEARANCE"}
+                    if self.homed:
+                        return 409, {"error": "ALREADY_HOMED"}
+                    if self.nudge_remaining < 10:
+                        return 409, {"error": "NUDGE_BUDGET_EXHAUSTED"}
+                    self.nudge_remaining -= 10
+                    self.state = "MOVING"
+                    self.target = self.pos | {axis: self.pos[axis] + delta}
                 else:
                     axis, target, feed = (body.get(k) for k in ("axis", "to", "feed"))
-                    if (axis not in AXES or type(target) is not int or type(feed) is not int
-                            or not 1000 <= feed <= 20000 or not (-10000 <= target <= 10000)
-                            or (axis == "z" and target != 0)):
+                    if axis == "z":
+                        return 400, {"error": "Z_FIXED"}
+                    if (axis not in ("j1", "j2") or type(target) is not int or type(feed) is not int
+                            or not 1000 <= feed <= 20000
+                            or not BOUNDS[axis][0] <= target <= BOUNDS[axis][1]):
                         return 400, {"error": "INVALID_TARGET_OR_FEED"}
                     if not self.homed or self.pos["z"] != 0:
                         return 409, {"error": "NOT_HOMED_OR_SAFE_Z"}

@@ -31,13 +31,14 @@ local `secrets.h` and generate a **separate** controller token. Read the IP from
 the serial console at 115200; try `scara.local` if mDNS is supported on your LAN.
 Every request needs `X-SCARA-Token`. This is plain HTTP: keep it on a trusted isolated
 lab network (not campus-wide or the internet). The Jetson hardware dashboard binds
-only to loopback; access it through SSH. No fallback access point or manual jog page.
+only to loopback; access it through SSH. There is no fallback access point.
 
 | Method | Endpoint | Body | Successful response |
 |---|---|---|---|
 | GET | `/status` | none | `200` state, position, limits and flags |
 | POST | `/home` | `{"boot":"…","command_id":16}` | `202`, async J1 → J2; no Z motion |
 | POST | `/move` | `{"boot":"…","command_id":17,"axis":"j1","to":120,"feed":2000}` | `202`, bounded absolute steps |
+| POST | `/nudge` | `{"boot":"…","command_id":17,"axis":"j2","delta":10,"clearance_confirmed":true}` | `202`, opt-in pre-home bench nudge; see [command guide](command-guide.md) |
 | POST | `/heartbeat` | `{"boot":"…","command_id":17}` | `200`, extends that active motion lease |
 | POST | `/spindle` | `{"on":false}` | `200`; `true` always rejected in this version |
 | POST | `/stop` | `{}` | `200`, stops pulses, spindle off, latches HOLD |
@@ -47,7 +48,10 @@ only to loopback; access it through SSH. No fallback access point or manual jog 
 POSTs use JSON. Success returns `{"boot":"…","command_id":17}`. Status includes
 `fw`, `boot`, `command_id`, `state`, `homed`, `pos`, `target`, `limits`, `spindle`,
 `fault`, `commissioned`, and `simulator`, plus `z_mode: "fixed"` and informational
-`rssi` (dBm) and `ip` on hardware. Axis keys are `z`, `j1`, `j2`; limit `0`
+`rssi` (dBm) and `ip` on hardware. `bounds` gives inclusive absolute step ranges.
+`home_axis` and `home_phase` show the active or failed homing phase. A budget
+fault names both, e.g. `HOME_TIMEOUT_J2_SEEK`; it still latches until Reset.
+Axis keys are `z`, `j1`, `j2`; limit `0`
 means active-low contact and `1` means clear. Non-2xx responses include `error`.
 `feed` is a half-period in microseconds (1,000–20,000; scheduler may make it longer).
 Homing seeks, releases, re-latches slowly, then steps off the switch. It never goes
@@ -69,9 +73,10 @@ emergency stop that removes hazardous energy.
 ## Try the UI and commission in order
 
 **Simulator:** `./start.sh --serve --simulate-robot` uses the live webcam; add
-`--replay <image>` to use a known-good fixture capture. Click **Start**, inspect the
-proposed/rounded positions at **Review**, then **Approve dry run**. It returns to
-park and compares a second scan. This proves sequencing, not machining.
+`--replay <image>` to use a known-good fixture capture. The dashboard shows
+**Homing → Scanning → Planning → Executing → Done**. Click **Start**, inspect the
+proposed/rounded positions, then click **Approve & execute dry run**. Parking
+and the verification scan still happen. This proves sequencing, not machining.
 
 **Bench setup:**
 
@@ -112,6 +117,9 @@ park and compares a second scan. This proves sequencing, not machining.
    before setting `MOTION_COMMISSIONED = true`. A step budget limits commanded
    travel; it does not prevent a hit if a stop is closer than that budget.
    Verify the full J1 → J2 homing sweep and park path clear the fixture and cables.
+   If J2 moves unevenly, isolate power and investigate binding, the belt, wiring,
+   and driver current before extending the seek or repeating a powered test. The
+   step count describes pulses sent, not distance actually moved.
    An open-loop controller cannot detect missed steps; a stop/fault requires reset
    and re-home.
 4. Run with `SCARA_ROBOT_TOKEN` set locally:
@@ -123,6 +131,56 @@ park and compares a second scan. This proves sequencing, not machining.
    Supply `0 0` only if the backed-off home pose actually clears the camera. Otherwise
    supply a measured camera-clear J1/J2 step pair. **Start** homes J1/J2, parks,
    then scans and reviews coordinates with no target motion if calibration is absent.
+   This is **Mode B**. Leave `--enable-hardware-dry-run` off. The default paper
+   preset includes the six nominal targets; no separate reference CSV is required
+   for the matching printed fixture.
+
+### Manual setup and pose logging
+
+Open **Manual control** (`/manual`) from the robot dashboard. It keeps the
+live camera visible and does not run a scan. To start on this page and disable
+the vision workflow, launch:
+
+```bash
+./start.sh --serve --robot-url http://scara.local --manual-only
+```
+
+Manual controls do not require a park pose, tags, a reference CSV or calibration.
+Use **Home J1/J2** to establish the joint step reference for normal jogs, or
+follow the [pre-home bench procedure](command-guide.md#pre-home-bench-test).
+The controller must be commissioned and have clear limits for movement.
+Normal jog commands are single moves of 10, 25, or
+50 steps at a fixed feed; there is no hold-to-repeat, and a move outside verified
+firmware step bounds is rejected rather than clipped. The limits do not detect
+obstacles. **Return to park** moves J1, then J2; verify the entire path before
+commanding it. A manual move or changing park clears any pending plan.
+
+**Save as park (session)** does not persist across dashboard restarts. Copy the
+displayed J1/J2 pair into `--park-steps J1 J2` after confirming camera clearance
+and the approach path. The live readout shows commanded steps, not encoder
+feedback, and a clear bottom switch does not verify Z clearance.
+
+**Record pose** saves the current idle, homed step pair from the controller.
+Add a label and optional measured fixture XY for observations; both coordinates
+are required for a calibration **fit** or **check** row. Records are written to
+`runs/poses.jsonl` by default (`--runs-dir` overrides the directory). The CSV
+download includes only the current mode (simulator or physical).
+
+### Diagnose a home attempt
+
+Both **Home only** and **Start** save a trace for the home command, including
+attempts that end in FAULT. Download **Homing CSV** and **Summary JSON** from
+the Robot panel. Older attempts stay under `runs/homing/home-*/`
+(`--runs-dir` overrides `runs`). Each row records elapsed time, controller
+boot/command IDs, J1/J2 commanded step counts, switch inputs (0 pressed,
+1 clear), and the reported state, phase and fault. Sampling happens during the
+normal controller poll; it can miss fast transitions and switch bounce.
+
+If the live camera was available, **Before photo** and **After photo** are
+saved with the trace. They are ordinary camera frames, not a measurement of
+joint angles, tool XY, or Z clearance. Compare the stationary endpoints with
+the commanded counts when looking for lost motion. The existing fixture scan
+provides XY coordinates for PCB targets only.
 
 ## Calibrate after the link is up
 

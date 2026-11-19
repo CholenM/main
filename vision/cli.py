@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+import ipaddress
 import json
 import math
 import os
@@ -63,19 +64,50 @@ def camera_lock():
 
 def serve(args, replay_frame):
     with exclusive(".viewer.lock", "A viewer is already running. Use ./stop.sh first."), \
-            (sim.server() if args.simulate_robot else nullcontext(None)) as sim_address:
+            (sim.server() if args.simulate_robot or args.console else nullcontext(None)) as sim_address:
         session = Session(args, replay_frame)
-        if sim_address or args.robot_url:
+        simulation = None
+
+        def workflow_for(view, address, token, simulated, park=None):
+            return Workflow(
+                RobotClient(address, token), view,
+                None if args.manual_only else Planner.load(args.calibration, simulated),
+                park=dict(zip(("j1", "j2"), park)) if park is not None else None,
+                simulated=simulated, enable_dry_run=args.enable_hardware_dry_run,
+                budget=args.placement_budget, enable_manual=True,
+                pose_log=args.runs_dir / "poses.jsonl", manual_only=args.manual_only)
+
+        if args.console:
+            simulation = Session(args, f.demo_frame(), demo=True)
+            simulation.workflow = workflow_for(simulation, *sim_address, True, (0, 0))
+
+            def connect(data):
+                address, token = data.get("ip"), data.get("token")
+                try:
+                    ip = ipaddress.IPv4Address(address) if isinstance(address, str) else None
+                except ValueError:
+                    ip = None
+                if not ip or not any(ip in ipaddress.IPv4Network(cidr)
+                                     for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
+                    raise RobotError("Enter the ESP32's private IPv4 address (for example, 10.42.0.16).")
+                if (not isinstance(token, str) or not 16 <= len(token) <= 128 or
+                        any(not 33 <= ord(char) <= 126 for char in token)):
+                    raise RobotError("Enter the token from the ESP32's secrets.h.")
+                candidate = workflow_for(session, f"http://{ip}", token, False)
+                if candidate.client.status()["simulator"]:
+                    raise RobotError("The hardware connection cannot point to a simulator.")
+                return candidate
+
+            session.connector = connect
+        elif sim_address or args.robot_url:
             address, token = sim_address or (args.robot_url, os.environ.get("SCARA_ROBOT_TOKEN", ""))
             if not token:
                 raise RobotError("Set SCARA_ROBOT_TOKEN before connecting to a physical controller.")
-            planner = Planner.load(args.calibration, args.simulate_robot)
-            park = args.park_steps if args.park_steps is not None else (0, 0) if sim_address else None
-            session.workflow = Workflow(RobotClient(address, token), session, planner,
-                                        dict(zip(("j1", "j2"), park)) if park is not None else None,
-                                        args.simulate_robot, args.enable_hardware_dry_run,
-                                        args.placement_budget)
-        handler = partial(Dashboard, session=session)
+            park = args.park_steps
+            if park is None and sim_address and not args.manual_only:
+                park = (0, 0)
+            session.workflow = workflow_for(session, address, token, args.simulate_robot, park)
+        handler = partial(Dashboard, session=session, simulation=simulation)
         with ThreadingHTTPServer((args.bind, args.port), handler) as server:
             if replay_frame is not None and session.workflow is None:
                 session.measure()
@@ -85,9 +117,12 @@ def serve(args, replay_frame):
 
             signal.signal(signal.SIGTERM, terminate)
             try:
-                with (camera_lock() if replay_frame is None else nullcontext()):
-                    with (LiveCamera(args.camera) if replay_frame is None else nullcontext()) as camera:
+                use_camera = replay_frame is None
+                with (camera_lock() if use_camera else nullcontext()):
+                    with (LiveCamera(args.camera) if use_camera else nullcontext()) as camera:
                         session.camera = camera
+                        if simulation:
+                            simulation.camera = camera
                         pid = os.getpid()
                         pending = PIDFILE.with_suffix(".tmp")
                         pending.write_text(json.dumps({"pid": pid, "start": proc_token(pid)}))
@@ -98,12 +133,13 @@ def serve(args, replay_frame):
                         try:
                             server.serve_forever()
                         finally:
-                            workflow = session.workflow
-                            if workflow and workflow.worker and workflow.worker.is_alive():
-                                try:
-                                    workflow.stop()
-                                except RobotError as exc:
-                                    print(f"Vision: {exc}", file=sys.stderr)
+                            for view in (session, simulation):
+                                workflow = view.workflow if view else None
+                                if workflow and workflow.worker and workflow.worker.is_alive():
+                                    try:
+                                        workflow.stop()
+                                    except RobotError as exc:
+                                        print(f"Vision: {exc}", file=sys.stderr)
             except KeyboardInterrupt:
                 pass
             finally:
@@ -122,6 +158,7 @@ def main():
     parser.add_argument("--replay", type=Path, help="image file or previous run directory")
     parser.add_argument("--runs-dir", type=Path, default=RUNS)
     parser.add_argument("--serve", action="store_true", help="start the live dashboard (or offline replay viewer)")
+    parser.add_argument("--console", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--bind", default="127.0.0.1", help="viewer interface; defaults to local only")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--self-test", action="store_true", help="capture one frame and check camera availability")
@@ -133,11 +170,19 @@ def main():
     parser.add_argument("--calibration", type=Path, help="measured calibration JSON for motion planning")
     parser.add_argument("--enable-hardware-dry-run", action="store_true",
                         help="permit raised-tool moves after calibration and operator approval")
+    parser.add_argument("--enable-hardware-manual", action="store_true",
+                        help=argparse.SUPPRESS)  # Compatibility with older launch commands.
+    parser.add_argument("--manual-only", action="store_true",
+                        help="open J1/J2 controls with live preview and disable the scan workflow")
     parser.add_argument("--placement-budget", type=float, default=.5, metavar="MM")
     parser.add_argument("--stop-viewer", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.stop_viewer:
         return stop()
+    if args.console and (not args.serve or args.simulate_robot or args.robot_url or args.replay or
+                         args.calibration or args.manual_only or args.verify or args.self_test or
+                         args.bind not in ("localhost", "127.0.0.1")):
+        parser.error("The interactive console requires a loopback dashboard without a preselected mode.")
     if not (0 < args.min_diameter <= args.max_diameter <= f.HEIGHT):
         parser.error(f"expected 0 < min-diameter <= max-diameter <= {f.HEIGHT} mm")
     if args.verify and args.preset == "pcb" and args.reference is None:
@@ -147,9 +192,14 @@ def main():
     if (args.simulate_robot or args.robot_url) and (not args.serve or args.verify or args.self_test):
         parser.error("Robot workflows require --serve in target detection mode")
     if args.robot_url and (args.replay or args.bind not in ("127.0.0.1", "localhost")):
-        parser.error("Physical controller mode requires live captures and a loopback dashboard. Use an SSH tunnel.")
+        parser.error("Physical controller mode requires a loopback dashboard and does not allow replay. Use an SSH tunnel.")
+    if args.manual_only and (not (args.robot_url or args.simulate_robot) or
+                             args.replay or args.calibration or args.enable_hardware_dry_run):
+        parser.error("--manual-only requires a robot mode and does not use replay, calibration, or dry-run execution")
     if args.enable_hardware_dry_run and not (args.robot_url and args.calibration and args.park_steps is not None):
         parser.error("Hardware dry run requires --robot-url, --calibration and --park-steps")
+    if args.enable_hardware_manual and not args.robot_url:
+        parser.error("Hardware manual controls require --robot-url")
     try:
         frame = None
         if args.replay:
